@@ -393,13 +393,19 @@ function Auth({
   const [driverLicenseSelected, setDriverLicenseSelected] = useState(false)
   const [vehicleName, setVehicleName] = useState("")
   const [vehicleCapacity, setVehicleCapacity] = useState("5")
-  const [loginId, setLoginId] = useState("shingu24")
-  const [loginPassword, setLoginPassword] = useState("test1234")
+  const [loginId, setLoginId] = useState("")
+  const [loginPassword, setLoginPassword] = useState("")
   const [resetEmail, setResetEmail] = useState("")
   const [authLoading, setAuthLoading] = useState(false)
+  const [authError, setAuthError] = useState("")
 
   const handleLogin = async (targetRole: Role) => {
+    if (!loginId.trim() || !loginPassword.trim()) {
+      setAuthError("아이디와 비밀번호를 입력해 주세요.")
+      return
+    }
     setAuthLoading(true)
+    setAuthError("")
     const email = loginId.includes("@") ? loginId.trim() : `${loginId.trim()}@shingu.ac.kr`
     try {
       if (isSupabaseConfigured()) {
@@ -407,36 +413,46 @@ function Auth({
         const user = result?.user
         const meta = user?.user_metadata
         onLogin(targetRole, {
-          name: meta?.name || "박민지",
+          name: meta?.name || email.split("@")[0] || "사용자",
           email: user?.email || email,
           id: user?.id || loginId,
-          phone: meta?.phone || "010-1234-5678",
+          phone: meta?.phone || "",
           gender: meta?.gender || "선택 안 함",
         })
         return
       }
+      onLogin(targetRole)
     } catch (err) {
-      console.warn("Supabase 로그인 실패(데모 모드로 진행):", err)
+      const msg = err instanceof Error ? err.message : "로그인에 실패했습니다."
+      setAuthError(
+        msg.includes("Invalid login credentials")
+          ? "아이디 또는 비밀번호가 일치하지 않습니다."
+          : msg,
+      )
     } finally {
       setAuthLoading(false)
     }
-    onLogin(targetRole)
   }
 
   const handleSignupComplete = async () => {
+    if (!signupId.trim() || !signupPassword.trim()) {
+      alert("아이디와 비밀번호를 입력해 주세요.")
+      return
+    }
     setAuthLoading(true)
     const email = signupId.includes("@") ? signupId.trim() : `${signupId.trim()}@shingu.ac.kr`
     try {
       if (isSupabaseConfigured()) {
         const result = await supabaseSignUp(email, signupPassword, {
-          name: signupName || "신규 회원",
+          name: signupName.trim() || email.split("@")[0],
           phone,
           gender: "선택 안 함",
           role,
         })
         const user = result?.user
+        alert("회원가입이 완료되었습니다!")
         onLogin(role, {
-          name: signupName || "신규 회원",
+          name: signupName.trim() || email.split("@")[0],
           email,
           id: user?.id || signupId,
           phone,
@@ -444,18 +460,18 @@ function Auth({
         })
         return
       }
+      onLogin(role, {
+        name: signupName.trim() || "신규 회원",
+        email,
+        id: signupId,
+        phone,
+        gender: "선택 안 함",
+      })
     } catch (err) {
-      console.warn("Supabase 회원가입 실패(데모 모드로 진행):", err)
+      alert(err instanceof Error ? err.message : "회원가입에 실패했습니다.")
     } finally {
       setAuthLoading(false)
     }
-    onLogin(role, {
-      name: signupName || "신규 회원",
-      email,
-      id: signupId,
-      phone,
-      gender: "선택 안 함",
-    })
   }
 
   const handleResetPassword = async () => {
@@ -795,6 +811,7 @@ function Auth({
           <label className="toggle-label login-keep">
             <input type="checkbox" defaultChecked /> 로그인 상태 유지
           </label>
+          {authError && <span className="field-error">{authError}</span>}
           <Button onClick={() => handleLogin("rider")} disabled={authLoading}>
             {authLoading ? "로그인 중..." : "로그인"}
           </Button>
@@ -806,9 +823,6 @@ function Auth({
           처음이신가요?{" "}
           <button onClick={() => setView("signup")}>신구길 가입하기</button>
         </p>
-        <Button variant="soft" onClick={() => handleLogin("driver")} disabled={authLoading}>
-          <CarFront /> 운전자 데모로 입장
-        </Button>
       </div>
       <p className="demo-note">
         <ShieldCheck /> 신구대학교 이메일 인증 학생 전용 서비스
@@ -1035,7 +1049,7 @@ function RiderHome({
           </div>
         </div>
         <p className="section-sub">
-          시간과 경로를 분석한 데모 추천이에요. 좌우로 넘겨보세요.
+          시간과 경로를 분석한 맞춤 추천이에요. 좌우로 넘겨보세요.
         </p>
         {matchedRides.length > 0 ? (
           <>
@@ -1145,8 +1159,8 @@ function RiderHome({
         ) : (
           <div className="recommendation-empty">
             <Route />
-            <strong>추천 조건을 설정해 주세요</strong>
-            <p>출발지, 목적지와 희망 시간을 저장하면 맞는 카풀을 찾아드려요.</p>
+            <strong>등록된 카풀이 없습니다</strong>
+            <p>출발지, 목적지와 희망 시간을 저장하거나 새 카풀이 등록되면 안내해 드려요.</p>
             <Button variant="soft" onClick={() => open("route-edit")}>
               기본 경로 설정
             </Button>
@@ -1211,6 +1225,7 @@ function RiderHome({
 function DriverHome({
   open,
   route,
+  account,
   tripFlow,
   onStartTrip,
   onEndTrip,
@@ -1221,6 +1236,7 @@ function DriverHome({
 }: {
   open: (sheet: Sheet) => void
   route: RouteData
+  account?: AccountData
   tripFlow: DemoTripFlow
   onStartTrip: () => void
   onEndTrip: () => void
@@ -1249,17 +1265,21 @@ function DriverHome({
       <section className="hello driver-hello">
         <div>
           <p>안전한 운행 준비되셨나요?</p>
-          <h1>도윤님, 좋은 아침이에요</h1>
+          <h1>
+            {account?.name
+              ? `${account.name}님, 좋은 아침이에요`
+              : "운전자님, 좋은 아침이에요"}
+          </h1>
         </div>
         <span className="verified">
-          <ShieldCheck /> 데모 등록 완료
+          <ShieldCheck /> 면허 인증 완료
         </span>
       </section>
-      {newestRide && (
+      {newestRide ? (
         <section className="section integrated-flow-card">
           <div className="section-heading">
             <div>
-              <span className="eyebrow">DEMO CARPOOL FLOW</span>
+              <span className="eyebrow">운행 관리</span>
               <h2>최근 등록한 카풀</h2>
             </div>
             <span
@@ -1310,7 +1330,7 @@ function DriverHome({
               <div className="demo-banner">
                 <CircleHelp />
                 <p>
-                  <strong>데모 정산 대기</strong>
+                  <strong>정산 대기</strong>
                   운행이 종료되었습니다. 정산을 진행해 주세요.
                 </p>
               </div>
@@ -1321,7 +1341,7 @@ function DriverHome({
           )}
           {pendingApplication && (
             <article className="integrated-request">
-              <div className="avatar green">박</div>
+              <div className="avatar green">{pendingApplication.riderName.slice(0, 1)}</div>
               <div>
                 <strong>{pendingApplication.riderName} 탑승 신청</strong>
                 <small>
@@ -1349,6 +1369,17 @@ function DriverHome({
               </div>
             </article>
           )}
+        </section>
+      ) : (
+        <section className="section integrated-flow-card">
+          <div className="recommendation-empty">
+            <CarFront />
+            <strong>등록된 카풀이 없습니다</strong>
+            <p>직접 운행 일정을 등록하고 함께 이동할 탑승자를 모집해 보세요.</p>
+            <Button onClick={() => open("create")}>
+              <Plus /> 카풀 운행 등록하기
+            </Button>
+          </div>
         </section>
       )}
       <section className="driver-summary">
@@ -1507,36 +1538,41 @@ function DriverHome({
           <h2>새 탑승 신청</h2>
           <button onClick={() => open("applications")}>전체보기</button>
         </div>
-        <div className="request-card">
-          <div className="avatar green">박</div>
-          <div>
-            <strong>박민지</strong>
-            <span>
-              <Star /> 4.9 · 탑승 12회
-            </span>
-            <small>모란역에서 탑승 희망</small>
+        {carpoolFlow.applications.filter((item) => item.status === "승인 대기").length > 0 ? (
+          carpoolFlow.applications
+            .filter((item) => item.status === "승인 대기")
+            .map((app) => (
+              <div className="request-card" key={app.id}>
+                <div className="avatar green">{app.riderName.slice(0, 1) || "탑"}</div>
+                <div>
+                  <strong>{app.riderName}</strong>
+                  <span>탑승 신청 대기 중</span>
+                  <small>
+                    {new Date(app.createdAt).toLocaleDateString("ko-KR")} 신청
+                  </small>
+                </div>
+                <div className="request-actions">
+                  <Button
+                    variant="ghost"
+                    onClick={() => decideCarpoolApplication(app.id, "reject")}
+                  >
+                    거절
+                  </Button>
+                  <Button
+                    onClick={() => decideCarpoolApplication(app.id, "approve")}
+                  >
+                    승인
+                  </Button>
+                </div>
+              </div>
+            ))
+        ) : (
+          <div className="schedule-empty compact-empty">
+            <UsersRound />
+            <strong>새로운 탑승 신청이 없습니다</strong>
+            <p>탑승자가 카풀을 신청하면 여기에 표시됩니다.</p>
           </div>
-          <div className="request-actions">
-            <Button
-              variant="ghost"
-              disabled={approved}
-              onClick={() => alert("탑승 신청이 거절 처리되었습니다.")}
-            >
-              거절
-            </Button>
-            <Button
-              disabled={approved}
-              onClick={() => {
-                writeDemoValue("request-approved", "true")
-                writeDemoValue("chat-created", "true")
-                setApproved(true)
-                setApprovalNoticeOpen(true)
-              }}
-            >
-              {approved ? "승인 완료" : "승인"}
-            </Button>
-          </div>
-        </div>
+        )}
       </section>
       {approvalNoticeOpen && (
         <div className="dialog-backdrop flow-dialog-backdrop">
@@ -1600,8 +1636,8 @@ function SchedulePage({
   const selectedKey = formatDateKey(selectedDate)
   const selectedSchedules = demoScheduleByDate[selectedKey] || []
   const visibleFlowRides = carpoolFlow.rides.filter((ride) => {
-    if (role === "driver") return ride.driverId === "demo-driver"
-    return ride.status === "모집 중"
+    if (role === "driver") return true
+    return ride.status === "모집 중" || ride.status === "완료"
   })
   const selectedFlowRides = visibleFlowRides.filter(
     (ride) => ride.date === selectedKey,
@@ -1797,8 +1833,8 @@ function SchedulePage({
         ) : (
           <div className="schedule-empty">
             <CalendarDays />
-            <strong>등록된 카풀이 없어요</strong>
-            <p>해당 날짜의 카풀 내역이 없습니다.</p>
+            <strong>등록된 카풀이 없습니다</strong>
+            <p>선택하신 날짜에 예정된 카풀 일정이 없습니다.</p>
           </div>
         )}
       </div>
@@ -2152,7 +2188,7 @@ function ChatPage({
                 <WalletCards />
               </span>
               <h2>정산을 진행할까요?</h2>
-              <p>발표용 데모 정산이며 실제 금전 결제는 발생하지 않습니다.</p>
+              <p>운행이 완료된 카풀의 정산을 진행합니다.</p>
               <div className="dialog-actions">
                 <Button
                   variant="ghost"
@@ -2166,7 +2202,7 @@ function ChatPage({
                     setSettlementConfirmOpen(false)
                   }}
                 >
-                  데모 정산 완료
+                  정산 완료
                 </Button>
               </div>
             </section>
@@ -2269,9 +2305,17 @@ function ChatPage({
         </>
       ) : (
         <div className="chat-search-empty">
-          <Search />
-          <strong>검색 결과가 없습니다.</strong>
-          <p>다른 이름이나 경로로 검색해 보세요.</p>
+          <MessageCircle />
+          <strong>
+            {hasSearchQuery
+              ? "검색 결과가 없습니다."
+              : "참여 중인 채팅방이 없습니다."}
+          </strong>
+          <p>
+            {hasSearchQuery
+              ? "다른 이름이나 경로로 검색해 보세요."
+              : "카풀 탑승 신청이 승인되면 채팅방이 생성됩니다."}
+          </p>
         </div>
       )}
     </div>
@@ -2304,7 +2348,7 @@ function ProfilePage({
   carpoolFlow: DemoCarpoolState
 }) {
   const flowReviews: DemoReview[] = carpoolFlow.reviews.map((review) => ({
-    author: "박민지 탑승자 · 데모 리뷰",
+    author: "탑승자 리뷰",
     date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
     score: review.rating,
     text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
@@ -2316,9 +2360,13 @@ function ProfilePage({
     ...demoReceivedReviews,
   ]
   const reviewCount = profileReviews.length
-  const averageRating = (
-    profileReviews.reduce((sum, item) => sum + item.score, 0) / reviewCount
-  ).toFixed(1)
+  const averageRating =
+    reviewCount > 0
+      ? (
+          profileReviews.reduce((sum, item) => sum + item.score, 0) /
+          reviewCount
+        ).toFixed(1)
+      : "5.0"
   const visibleBadges = demoProfileBadges
     .filter(
       (badge) => badge.role === role && selectedBadges[role].includes(badge.id),
@@ -2340,17 +2388,16 @@ function ProfilePage({
       </div>
       <section className="profile-card">
         <div className="profile-avatar">
-          민
+          {account.name.slice(0, 1) || "신"}
           <span>
             <ShieldCheck />
           </span>
         </div>
         <div>
-          <h2>{account.name}</h2>
-          <p>컴퓨터소프트웨어과 · 2학년</p>
-          <p>{account.email}</p>
+          <h2>{account.name || "사용자"}</h2>
+          <p>{account.email || "이메일 미등록"}</p>
           <span className="verified-text">
-            <ShieldCheck /> 학교 이메일 데모 확인
+            <ShieldCheck /> 학교 이메일 인증
           </span>
         </div>
         <button onClick={() => open("account")} aria-label="내 계정 정보">
@@ -2478,7 +2525,7 @@ function ProfilePage({
           <ChevronRight />
         </button>
       </nav>
-      <p className="version">신구길 데모 v1.0.0</p>
+      <p className="version">신구길 v1.0.0</p>
     </div>
   )
 }
@@ -2510,9 +2557,11 @@ function BottomNav({ tab, setTab }: { tab: Tab; setTab: (tab: Tab) => void }) {
 function RoleRegistration({
   role,
   onComplete,
+  account,
 }: {
   role: Role
   onComplete: (role: Role) => void
+  account?: AccountData
 }) {
   const [licenseVerified, setLicenseVerified] = useState(false)
   const [capacity, setCapacity] = useState(5)
@@ -2544,16 +2593,16 @@ function RoleRegistration({
     <form className="registration-form" onSubmit={submit}>
       <div className="account-confirm">
         <div className="profile-avatar small">
-          민
+          {account?.name?.slice(0, 1) || "신"}
           <span>
             <ShieldCheck />
           </span>
         </div>
         <div>
-          <strong>박민지</strong>
-          <span>shingu24@shingu.ac.kr</span>
+          <strong>{account?.name || "사용자"}</strong>
+          <span>{account?.email || ""}</span>
           <small>
-            <Check /> 신구대학교 이메일 데모 확인
+            <Check /> 신구대학교 이메일 인증 완료
           </small>
         </div>
       </div>
@@ -2590,7 +2639,7 @@ function RoleRegistration({
           >
             {licenseVerified ? (
               <>
-                <Check /> 데모 면허 인증 완료
+                <Check /> 면허 인증 완료
               </>
             ) : (
               <>
@@ -2599,7 +2648,7 @@ function RoleRegistration({
             )}
           </Button>
           <p className="helper">
-            현재는 데모 인증이며 실제 심사나 외부 기관 조회는 진행되지 않습니다.
+            안전한 카풀 운행을 위해 운전면허 정보를 확인합니다.
           </p>
           <div className="two-fields">
             <Field label="차량 종류" name="carType" defaultValue="승용차" />
@@ -3173,12 +3222,18 @@ function SheetView({
       carpoolFlow.applications.some(
         (application) =>
           application.rideId === ride.flowRideId &&
+          application.riderId === account.id ||
+          application.riderId === "user-rider" ||
           application.riderId === "demo-rider",
       ),
     )
   const applyToMatchRide = (ride: MatchRide) => {
     if (isRideApplied(ride)) return
-    if (ride.flowRideId) applyToCarpool(ride.flowRideId)
+    if (ride.flowRideId)
+      applyToCarpool(ride.flowRideId, {
+        id: account.id,
+        name: account.name || "탑승자",
+      })
     setAppliedRideIds((current) => [...current, ride.id])
   }
   const isEditingAccount = type === "account-edit" || editingAccount
@@ -3794,6 +3849,8 @@ function SheetView({
               onClick={() => {
                 try {
                   createCarpoolRide({
+                    driverId: account.id,
+                    driverName: account.name || "운전자",
                     start: createDraft.start,
                     destination: createDraft.destination,
                     date: createDraft.date,
@@ -3984,7 +4041,10 @@ function SheetView({
                     <Button
                       onClick={() => {
                         try {
-                          applyToCarpool(applyRide.id)
+                          applyToCarpool(applyRide.id, {
+                            id: account.id,
+                            name: account.name || "탑승자",
+                          })
                           setApplyRide(null)
                           setFlowNotice("카풀 신청이 완료되었습니다.")
                         } catch (error) {
@@ -6656,9 +6716,7 @@ export default function App() {
   )
   const [splash, setSplash] = useState(true)
   const [auth, setAuth] = useState<AuthView>("login")
-  const [loggedIn, setLoggedIn] = useState(
-    () => readDemoValue("demo-login") === "true",
-  )
+  const [loggedIn, setLoggedIn] = useState(false)
   const [role, setRole] = useState<Role>(
     () => readDemoValue("demo-role") as Role || "rider",
   )
@@ -6807,6 +6865,7 @@ export default function App() {
       <DriverHome
         open={setSheet}
         route={routesByRole.driver}
+        account={account}
         tripFlow={tripFlow}
         onStartTrip={startDemoTrip}
         onEndTrip={endDemoTrip}

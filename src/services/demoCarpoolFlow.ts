@@ -19,7 +19,7 @@ export type CarpoolApplicationStatus = "승인 대기" | "승인 완료" | "거�
 
 export type DemoCarpoolRide = {
   id: string
-  driverId: "demo-driver"
+  driverId: string
   driverName: string
   start: string
   destination: string
@@ -45,9 +45,9 @@ export type DemoCarpoolRide = {
 export type DemoCarpoolApplication = {
   id: string
   rideId: string
-  riderId: "demo-rider"
+  riderId: string
   riderName: string
-  driverId: "demo-driver"
+  driverId: string
   createdAt: string
   status: CarpoolApplicationStatus
 }
@@ -55,8 +55,8 @@ export type DemoCarpoolApplication = {
 export type DemoCarpoolReview = {
   id: string
   rideId: string
-  authorId: "demo-rider"
-  targetId: "demo-driver"
+  authorId: string
+  targetId: string
   rating: number
   keywords: string[]
   content: string
@@ -177,7 +177,10 @@ export function getCarpoolFlowSnapshot() {
 }
 
 export function createCarpoolRide(
-  input: Omit<DemoCarpoolRide, "id" | "driverId" | "driverName" | "status" | "settlementStatus" | "endedAt" | "settledAt" | "createdAt">,
+  input: Omit<DemoCarpoolRide, "id" | "driverId" | "driverName" | "status" | "settlementStatus" | "endedAt" | "settledAt" | "createdAt"> & {
+    driverId?: string
+    driverName?: string
+  },
 ) {
   if (
     !input.start.trim() ||
@@ -197,8 +200,8 @@ export function createCarpoolRide(
   const ride: DemoCarpoolRide = {
     ...input,
     id: createId("carpool"),
-    driverId: "demo-driver",
-    driverName: "김도윤",
+    driverId: input.driverId || "user-driver",
+    driverName: input.driverName || "운전자",
     status: "모집 중",
     settlementStatus: "정산 전",
     endedAt: null,
@@ -208,9 +211,8 @@ export function createCarpoolRide(
   save({ ...snapshot, rides: [ride, ...snapshot.rides] })
   // Supabase DB 비동기 연동
   if (isSupabaseConfigured()) {
-    supabaseCreateRide(ride).then((inserted) => {
+    supabaseCreateRide(ride, input.driverId).then((inserted) => {
       if (inserted?.id) {
-        // DB에서 생성된 UUID가 있다면 교체
         const updatedRides = snapshot.rides.map((r) =>
           r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
         )
@@ -221,13 +223,18 @@ export function createCarpoolRide(
   return ride
 }
 
-export function applyToCarpool(rideId: string) {
+export function applyToCarpool(
+  rideId: string,
+  riderInfo?: { id?: string; name?: string },
+) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
   if (!ride || ride.status !== "모집 중")
     throw new Error("신청할 수 없는 카풀입니다.")
+  const currentRiderId = riderInfo?.id || "user-rider"
+  const currentRiderName = riderInfo?.name || "탑승자"
   if (
     snapshot.applications.some(
-      (item) => item.rideId === rideId && item.riderId === "demo-rider",
+      (item) => item.rideId === rideId && item.riderId === currentRiderId,
     )
   )
     throw new Error("이미 신청한 카풀입니다.")
@@ -238,15 +245,15 @@ export function applyToCarpool(rideId: string) {
   const application: DemoCarpoolApplication = {
     id: createId("application"),
     rideId,
-    riderId: "demo-rider",
-    riderName: "박민지",
+    riderId: currentRiderId,
+    riderName: currentRiderName,
     driverId: ride.driverId,
     createdAt: new Date().toISOString(),
     status: "승인 대기",
   }
   save({ ...snapshot, applications: [application, ...snapshot.applications] })
   if (isSupabaseConfigured()) {
-    supabaseCreateApplication(rideId, "박민지").catch(console.warn)
+    supabaseCreateApplication(rideId, currentRiderName, currentRiderId).catch(console.warn)
   }
   return application
 }
@@ -389,19 +396,22 @@ export function addCarpoolReview(
   rating: number,
   keywords: string[],
   content: string,
+  authorInfo?: { id?: string; name?: string },
 ) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
+  const currentAuthorId = authorInfo?.id || "user-rider"
+  const currentAuthorName = authorInfo?.name || "탑승자"
   const approved = snapshot.applications.some(
     (item) =>
       item.rideId === rideId &&
-      item.riderId === "demo-rider" &&
+      (item.riderId === currentAuthorId || item.riderId === "user-rider") &&
       item.status === "승인 완료",
   )
   if (!ride || ride.settlementStatus !== "정산 완료" || !approved)
     throw new Error("후기를 작성할 수 없는 카풀입니다.")
   if (
     snapshot.reviews.some(
-      (item) => item.rideId === rideId && item.authorId === "demo-rider",
+      (item) => item.rideId === rideId && item.authorId === currentAuthorId,
     )
   )
     throw new Error("이미 후기를 작성했습니다.")
@@ -410,8 +420,8 @@ export function addCarpoolReview(
   const review: DemoCarpoolReview = {
     id: createId("review"),
     rideId,
-    authorId: "demo-rider",
-    targetId: "demo-driver",
+    authorId: currentAuthorId,
+    targetId: ride.driverId,
     rating,
     keywords,
     content: content.trim(),
@@ -421,7 +431,7 @@ export function addCarpoolReview(
   if (isSupabaseConfigured()) {
     supabaseSubmitReview(
       {
-        author: "박민지",
+        author: currentAuthorName,
         date: new Date().toLocaleDateString("ko-KR"),
         score: rating,
         text: content.trim(),

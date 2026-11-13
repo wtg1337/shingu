@@ -18,7 +18,7 @@ export type DemoPointWallet = {
 }
 
 const STORAGE_KEY = "shingu-point-wallet"
-const INITIAL_WALLET: DemoPointWallet = { balance: 24_500, charges: [] }
+const INITIAL_WALLET: DemoPointWallet = { balance: 0, charges: [] }
 const listeners = new Set<() => void>()
 
 function isValidCharge(value: unknown): value is DemoPointCharge {

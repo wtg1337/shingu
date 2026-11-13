@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS public.carpool_applications (
 -- 5. 포인트 지갑 및 충전 내역 테이블 (Points)
 CREATE TABLE IF NOT EXISTS public.point_wallets (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
-  balance INT NOT NULL DEFAULT 24500,
+  balance INT NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
@@ -196,14 +196,3 @@ END $$;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.rides;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.carpool_applications;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.chat_messages;
-
--- ==============================================================================
--- 샘플 시드 데이터 (초기 운행 목록 예시)
--- ==============================================================================
-INSERT INTO public.rides (
-  driver_name, car_info, start_point, destination, waypoints, date, departure_time,
-  estimated_duration, arrival_time, seats, total_seats, price, match_rate, rating, reviews_count
-) VALUES 
-('김도윤', '현대 아반떼 · 흰색', '모란역 5번 출구', '신구대학교 정문', '태평역 · 성남시청', '2026.05.20', '오전 8:10', 28, '08:38', 2, 3, 2800, 94, 4.9, 24),
-('이서준', '기아 셀토스 · 회색', '야탑역 환승주차장', '신구대학교 서관', '모란역 · 수진역', '2026.05.20', '오전 8:25', 30, '08:55', 1, 3, 3200, 87, 4.8, 17)
-ON CONFLICT DO NOTHING;

@@ -6,7 +6,7 @@ const memberCodeKey = (accountId: string, role: Role) =>
   `shingu-mileage-member-code-${accountId}-${role}`
 
 export function getDemoMileageBalance(accountId: string, role: Role) {
-  const fallback = role === "driver" ? 12_840 : 0
+  const fallback = 0
   try {
     const stored = localStorage.getItem(balanceKey(accountId, role))
     if (stored === null) {
