@@ -1,3 +1,18 @@
+import {
+  calculateEstimatedArrival,
+  DEFAULT_ESTIMATED_DURATION,
+} from "./demoEta"
+import {
+  supabaseGetRides,
+  supabaseCreateRide,
+  supabaseUpdateRideStatus,
+  supabaseGetApplications,
+  supabaseCreateApplication,
+  supabaseUpdateApplicationStatus,
+  supabaseSubmitReview,
+} from "./supabaseService"
+import { supabase, isSupabaseConfigured } from "../lib/supabase"
+
 export type CarpoolRideStatus = "모집 중" | "정산 대기" | "완료"
 export type CarpoolSettlementStatus = "정산 전" | "정산 대기" | "정산 완료"
 export type CarpoolApplicationStatus = "승인 대기" | "승인 완료" | "거절 완료" | "취소 완료"
@@ -191,6 +206,18 @@ export function createCarpoolRide(
     createdAt: new Date().toISOString(),
   }
   save({ ...snapshot, rides: [ride, ...snapshot.rides] })
+  // Supabase DB 비동기 연동
+  if (isSupabaseConfigured()) {
+    supabaseCreateRide(ride).then((inserted) => {
+      if (inserted?.id) {
+        // DB에서 생성된 UUID가 있다면 교체
+        const updatedRides = snapshot.rides.map((r) =>
+          r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
+        )
+        save({ ...snapshot, rides: updatedRides })
+      }
+    }).catch(console.warn)
+  }
   return ride
 }
 
@@ -218,6 +245,9 @@ export function applyToCarpool(rideId: string) {
     status: "승인 대기",
   }
   save({ ...snapshot, applications: [application, ...snapshot.applications] })
+  if (isSupabaseConfigured()) {
+    supabaseCreateApplication(rideId, "박민지").catch(console.warn)
+  }
   return application
 }
 
@@ -262,6 +292,12 @@ export function decideCarpoolApplication(
           ]
         : snapshot.events,
   })
+  if (isSupabaseConfigured()) {
+    supabaseUpdateApplicationStatus(
+      applicationId,
+      decision === "approve" ? "승인 완료" : "거절 완료",
+    ).catch(console.warn)
+  }
 }
 
 export function cancelCarpoolApplication(applicationId: string) {
@@ -293,11 +329,15 @@ export function cancelCarpoolApplication(applicationId: string) {
       ...snapshot.events,
     ],
   })
+  if (isSupabaseConfigured()) {
+    supabaseUpdateApplicationStatus(applicationId, "취소 완료").catch(console.warn)
+  }
 }
 
 export function endCarpoolRide(rideId: string) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
   if (!ride || ride.status !== "모집 중") return
+  const endedAt = new Date().toISOString()
   save({
     ...snapshot,
     rides: snapshot.rides.map((item) =>
@@ -306,16 +346,23 @@ export function endCarpoolRide(rideId: string) {
             ...item,
             status: "정산 대기",
             settlementStatus: "정산 대기",
-            endedAt: new Date().toISOString(),
+            endedAt,
           }
         : item,
     ),
   })
+  if (isSupabaseConfigured()) {
+    supabaseUpdateRideStatus(rideId, "정산 대기", {
+      endedAt,
+      settlementStatus: "정산 대기",
+    }).catch(console.warn)
+  }
 }
 
 export function settleCarpoolRide(rideId: string) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
   if (!ride || ride.settlementStatus !== "정산 대기") return
+  const settledAt = new Date().toISOString()
   save({
     ...snapshot,
     rides: snapshot.rides.map((item) =>
@@ -324,11 +371,17 @@ export function settleCarpoolRide(rideId: string) {
             ...item,
             status: "완료",
             settlementStatus: "정산 완료",
-            settledAt: new Date().toISOString(),
+            settledAt,
           }
         : item,
     ),
   })
+  if (isSupabaseConfigured()) {
+    supabaseUpdateRideStatus(rideId, "완료", {
+      settledAt,
+      settlementStatus: "정산 완료",
+    }).catch(console.warn)
+  }
 }
 
 export function addCarpoolReview(
@@ -365,6 +418,18 @@ export function addCarpoolReview(
     createdAt: new Date().toISOString(),
   }
   save({ ...snapshot, reviews: [review, ...snapshot.reviews] })
+  if (isSupabaseConfigured()) {
+    supabaseSubmitReview(
+      {
+        author: "박민지",
+        date: new Date().toLocaleDateString("ko-KR"),
+        score: rating,
+        text: content.trim(),
+        tags: keywords,
+      },
+      rideId,
+    ).catch(console.warn)
+  }
   return review
 }
 
@@ -377,14 +442,62 @@ export function getRemainingSeats(state: DemoCarpoolState, rideId: string) {
   return Math.max(0, ride.totalSeats - occupied)
 }
 
+export async function syncCarpoolWithSupabase() {
+  if (!isSupabaseConfigured() || typeof window === "undefined") return
+  try {
+    const [remoteRides, remoteApps] = await Promise.all([
+      supabaseGetRides(),
+      supabaseGetApplications(),
+    ])
+
+    if (remoteRides.length > 0 || remoteApps.length > 0) {
+      const rideMap = new Map<string, DemoCarpoolRide>()
+      snapshot.rides.forEach((r) => rideMap.set(r.id, r))
+      remoteRides.forEach((r) => rideMap.set(r.id, r))
+
+      const appMap = new Map<string, DemoCarpoolApplication>()
+      snapshot.applications.forEach((a) => appMap.set(a.id, a))
+      remoteApps.forEach((a) => appMap.set(a.id, a))
+
+      save({
+        ...snapshot,
+        rides: Array.from(rideMap.values()),
+        applications: Array.from(appMap.values()),
+      })
+    }
+  } catch (err) {
+    console.warn("syncCarpoolWithSupabase error:", err)
+  }
+}
+
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
     if (event.key !== STORAGE_KEY) return
     snapshot = readState()
     listeners.forEach((listener) => listener())
   })
+
+  if (isSupabaseConfigured()) {
+    // 초기 로드 시 Supabase 데이터 동기화
+    syncCarpoolWithSupabase()
+
+    // 실시간 변경 구독
+    try {
+      supabase
+        .channel("carpool-realtime-changes")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "rides" },
+          () => syncCarpoolWithSupabase(),
+        )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "carpool_applications" },
+          () => syncCarpoolWithSupabase(),
+        )
+        .subscribe()
+    } catch (e) {
+      console.warn("Supabase realtime setup failed:", e)
+    }
+  }
 }
-import {
-  calculateEstimatedArrival,
-  DEFAULT_ESTIMATED_DURATION,
-} from "./demoEta"

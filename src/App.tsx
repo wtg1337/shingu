@@ -124,6 +124,16 @@ import {
   getDemoMileageBalance,
   getOrCreateMileageMemberCode,
 } from "./services/demoMileage"
+import {
+  supabaseSignIn,
+  supabaseSignUp,
+  supabaseSignOut,
+  supabaseResetPassword,
+  supabaseGetCurrentUser,
+  supabaseSaveRoute,
+  supabaseUpdateProfile,
+} from "./services/supabaseService"
+import { isSupabaseConfigured } from "./lib/supabase"
 import JsBarcode from "jsbarcode"
 import type {
   AccountData,
@@ -368,7 +378,7 @@ function Auth({
 }: {
   view: AuthView
   setView: (view: AuthView) => void
-  onLogin: (role: Role) => void
+  onLogin: (role: Role, userProfile?: Partial<AccountData>) => void
 }) {
   const [showPassword, setShowPassword] = useState(false)
   const [step, setStep] = useState(1)
@@ -383,6 +393,91 @@ function Auth({
   const [driverLicenseSelected, setDriverLicenseSelected] = useState(false)
   const [vehicleName, setVehicleName] = useState("")
   const [vehicleCapacity, setVehicleCapacity] = useState("5")
+  const [loginId, setLoginId] = useState("shingu24")
+  const [loginPassword, setLoginPassword] = useState("test1234")
+  const [resetEmail, setResetEmail] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
+
+  const handleLogin = async (targetRole: Role) => {
+    setAuthLoading(true)
+    const email = loginId.includes("@") ? loginId.trim() : `${loginId.trim()}@shingu.ac.kr`
+    try {
+      if (isSupabaseConfigured()) {
+        const result = await supabaseSignIn(email, loginPassword)
+        const user = result?.user
+        const meta = user?.user_metadata
+        onLogin(targetRole, {
+          name: meta?.name || "박민지",
+          email: user?.email || email,
+          id: user?.id || loginId,
+          phone: meta?.phone || "010-1234-5678",
+          gender: meta?.gender || "선택 안 함",
+        })
+        return
+      }
+    } catch (err) {
+      console.warn("Supabase 로그인 실패(데모 모드로 진행):", err)
+    } finally {
+      setAuthLoading(false)
+    }
+    onLogin(targetRole)
+  }
+
+  const handleSignupComplete = async () => {
+    setAuthLoading(true)
+    const email = signupId.includes("@") ? signupId.trim() : `${signupId.trim()}@shingu.ac.kr`
+    try {
+      if (isSupabaseConfigured()) {
+        const result = await supabaseSignUp(email, signupPassword, {
+          name: signupName || "신규 회원",
+          phone,
+          gender: "선택 안 함",
+          role,
+        })
+        const user = result?.user
+        onLogin(role, {
+          name: signupName || "신규 회원",
+          email,
+          id: user?.id || signupId,
+          phone,
+          gender: "선택 안 함",
+        })
+        return
+      }
+    } catch (err) {
+      console.warn("Supabase 회원가입 실패(데모 모드로 진행):", err)
+    } finally {
+      setAuthLoading(false)
+    }
+    onLogin(role, {
+      name: signupName || "신규 회원",
+      email,
+      id: signupId,
+      phone,
+      gender: "선택 안 함",
+    })
+  }
+
+  const handleResetPassword = async () => {
+    if (!resetEmail) {
+      alert("이메일을 입력해 주세요.")
+      return
+    }
+    setAuthLoading(true)
+    try {
+      if (isSupabaseConfigured()) {
+        await supabaseResetPassword(resetEmail)
+        alert(`${resetEmail}로 비밀번호 재설정 메일이 발송되었습니다.`)
+        setView("login")
+        return
+      }
+    } catch (err) {
+      console.warn("비밀번호 재설정 실패:", err)
+    } finally {
+      setAuthLoading(false)
+    }
+    alert("데모 인증번호 0624가 발송되었습니다.")
+  }
   const totalSignupSteps = role === "driver" ? 4 : 3
   const driverInfoValid =
     driverLicenseSelected &&
@@ -407,9 +502,14 @@ function Auth({
         </div>
         <div className="form-stack">
           <Field label="아이디" placeholder="아이디 입력" />
-          <Field label="학교 이메일" placeholder="student@shingu.ac.kr" />
-          <Button onClick={() => alert("데모 인증번호 0624가 발송되었습니다.")}>
-            인증번호 받기
+          <Field
+            label="학교 이메일"
+            placeholder="student@shingu.ac.kr"
+            value={resetEmail}
+            onChange={(event) => setResetEmail(event.target.value)}
+          />
+          <Button onClick={handleResetPassword} disabled={authLoading}>
+            {authLoading ? "전송 중..." : "인증번호 받기"}
           </Button>
           <p className="helper">
             실제 비밀번호는 안내하지 않으며, 인증 후 새 비밀번호를 설정합니다.
@@ -640,18 +740,21 @@ function Auth({
         <div className="signup-footer">
           <Button
             disabled={
+              authLoading ||
               (step === 1 && !verified) ||
               (step === 4 && !driverInfoValid)
             }
             onClick={() =>
-              step < totalSignupSteps ? setStep(step + 1) : onLogin(role)
+              step < totalSignupSteps ? setStep(step + 1) : handleSignupComplete()
             }
           >
-            {step === 3 && role === "driver"
-              ? "다음 ->"
-              : step === totalSignupSteps
-                ? "가입 완료하고 시작하기"
-                : "다음"}
+            {authLoading
+              ? "처리 중..."
+              : step === 3 && role === "driver"
+                ? "다음 ->"
+                : step === totalSignupSteps
+                  ? "가입 완료하고 시작하기"
+                  : "다음"}
           </Button>
         </div>
       </main>
@@ -668,7 +771,8 @@ function Auth({
           <Field
             label="아이디"
             placeholder="아이디를 입력하세요"
-            defaultValue="shingu24"
+            value={loginId}
+            onChange={(event) => setLoginId(event.target.value)}
           />
           <label className="field">
             <span>비밀번호</span>
@@ -676,7 +780,8 @@ function Auth({
               <input
                 type={showPassword ? "text" : "password"}
                 placeholder="비밀번호를 입력하세요"
-                defaultValue="test1234"
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
               />
               <button
                 className="field__button"
@@ -690,7 +795,9 @@ function Auth({
           <label className="toggle-label login-keep">
             <input type="checkbox" defaultChecked /> 로그인 상태 유지
           </label>
-          <Button onClick={() => onLogin("rider")}>로그인</Button>
+          <Button onClick={() => handleLogin("rider")} disabled={authLoading}>
+            {authLoading ? "로그인 중..." : "로그인"}
+          </Button>
           <button className="login-link" onClick={() => setView("reset")}>
             비밀번호를 잊으셨나요?
           </button>
@@ -699,7 +806,7 @@ function Auth({
           처음이신가요?{" "}
           <button onClick={() => setView("signup")}>신구길 가입하기</button>
         </p>
-        <Button variant="soft" onClick={() => onLogin("driver")}>
+        <Button variant="soft" onClick={() => handleLogin("driver")} disabled={authLoading}>
           <CarFront /> 운전자 데모로 입장
         </Button>
       </div>
@@ -6590,6 +6697,27 @@ export default function App() {
 
   useEffect(() => {
     const splashTimer = window.setTimeout(() => setSplash(false), 3000)
+    if (isSupabaseConfigured()) {
+      supabaseGetCurrentUser()
+        .then((user) => {
+          if (user) {
+            setLoggedIn(true)
+            const meta = user.user_metadata
+            setAccount((prev) => ({
+              ...prev,
+              id: user.id,
+              email: user.email || prev.email,
+              name: meta?.name || prev.name,
+              phone: meta?.phone || prev.phone,
+              gender: meta?.gender || prev.gender,
+            }))
+            if (meta?.role === "driver" || meta?.role === "rider") {
+              setRole(meta.role)
+            }
+          }
+        })
+        .catch(console.warn)
+    }
     return () => window.clearTimeout(splashTimer)
   }, [])
 
@@ -6663,6 +6791,9 @@ export default function App() {
           selectedBadges={selectedBadges}
           open={setSheet}
           logout={() => {
+            if (isSupabaseConfigured()) {
+              supabaseSignOut().catch(console.warn)
+            }
             removeDemoData("demo-login")
             setLoggedIn(false)
             setTab("home")
@@ -6737,9 +6868,13 @@ export default function App() {
         <Auth
           view={auth}
           setView={setAuth}
-          onLogin={(nextRole) => {
+          onLogin={(nextRole, userProfile) => {
             setRole(nextRole)
             setLoggedIn(true)
+            if (userProfile) {
+              setAccount((prev) => ({ ...prev, ...userProfile }))
+              writeDemoData("account", { ...account, ...userProfile })
+            }
             writeDemoValue("demo-login", "true")
             writeDemoValue("demo-role", nextRole)
             const updated = {
@@ -6804,10 +6939,16 @@ export default function App() {
             const updated = { ...routesByRole, [role]: nextRoute }
             setRoutesByRole(updated)
             writeDemoData("routes", updated)
+            if (isSupabaseConfigured()) {
+              supabaseSaveRoute(account.id, role, nextRoute).catch(console.warn)
+            }
           }}
           onSaveAccount={(nextAccount) => {
             setAccount(nextAccount)
             writeDemoData("account", nextAccount)
+            if (isSupabaseConfigured()) {
+              supabaseUpdateProfile(account.id, nextAccount).catch(console.warn)
+            }
           }}
           onSaveBadges={(badgeRole, badgeIds) => {
             const updated = { ...selectedBadges, [badgeRole]: badgeIds }

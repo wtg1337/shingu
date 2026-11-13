@@ -1,3 +1,6 @@
+import { supabaseChargePoints } from "./supabaseService"
+import { isSupabaseConfigured } from "../lib/supabase"
+
 export type DemoPaymentMethod = "카카오페이" | "토스페이" | "신용카드 간편결제"
 
 export type DemoPointCharge = {
@@ -96,6 +99,9 @@ export function chargeDemoPoints(
     balance: balanceAfter,
     charges: [charge, ...snapshot.charges],
   })
+  if (isSupabaseConfigured()) {
+    supabaseChargePoints("00000000-0000-0000-0000-000000000001", amount, paymentMethod, snapshot.balance).catch(console.warn)
+  }
   return charge
 }
 
