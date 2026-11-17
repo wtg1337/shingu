@@ -6,6 +6,7 @@ export type RouteData = {
   start: string
   destination: string
   waypoint: string
+  waypointsList?: string[]
   pickup: string
   weekdays: string[]
   departureTime: string

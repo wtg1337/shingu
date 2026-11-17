@@ -3,6 +3,11 @@ import {
   DEFAULT_ESTIMATED_DURATION,
 } from "./demoEta"
 import {
+  DIRECT_ROUTE_LABEL,
+  fetchRouteWaypointsFromMapBackend,
+  getExtractedWaypointsSync,
+} from "./routeWaypointService"
+import {
   supabaseGetRides,
   supabaseCreateRide,
   supabaseUpdateRideStatus,
@@ -30,6 +35,7 @@ export type DemoCarpoolRide = {
   price: number
   note: string
   waypoints: string
+  waypointsList?: string[]
   estimatedDuration: number
   estimatedArrival: string
   arrivalTimeManual: boolean
@@ -138,9 +144,15 @@ function readState(): DemoCarpoolState {
           ride.estimatedDuration > 0
             ? ride.estimatedDuration
             : DEFAULT_ESTIMATED_DURATION
+        const extracted = getExtractedWaypointsSync(
+          ride.start,
+          ride.destination,
+          ride.waypointsList ?? ride.waypoints ?? ride.note ?? "",
+        )
         return {
           ...ride,
-          waypoints: ride.waypoints ?? ride.note ?? "",
+          waypoints: extracted.formatted || DIRECT_ROUTE_LABEL,
+          waypointsList: extracted.waypointsList,
           estimatedDuration,
           estimatedArrival:
             ride.estimatedArrival ||
@@ -197,8 +209,15 @@ export function createCarpoolRide(
     input.price < 1
   )
     throw new Error("필수 입력 항목을 확인해 주세요.")
+  const syncExtracted = getExtractedWaypointsSync(
+    input.start,
+    input.destination,
+    input.waypointsList ?? input.waypoints,
+  )
   const ride: DemoCarpoolRide = {
     ...input,
+    waypoints: syncExtracted.formatted || DIRECT_ROUTE_LABEL,
+    waypointsList: syncExtracted.waypointsList,
     id: createId("carpool"),
     driverId: input.driverId || "user-driver",
     driverName: input.driverName || "운전자",
@@ -209,17 +228,36 @@ export function createCarpoolRide(
     createdAt: new Date().toISOString(),
   }
   save({ ...snapshot, rides: [ride, ...snapshot.rides] })
-  // Supabase DB 비동기 연동
-  if (isSupabaseConfigured()) {
-    supabaseCreateRide(ride, input.driverId).then((inserted) => {
-      if (inserted?.id) {
-        const updatedRides = snapshot.rides.map((r) =>
-          r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
-        )
-        save({ ...snapshot, rides: updatedRides })
+  // 백엔드 지도 라우팅 기반 경유지 비동기 정밀 갱신 및 DB 저장
+  void fetchRouteWaypointsFromMapBackend({
+    start: ride.start,
+    destination: ride.destination,
+    fallbackWaypoints: input.waypoints,
+  })
+    .then((mapResult) => {
+      const updatedRide: DemoCarpoolRide = {
+        ...ride,
+        waypoints: mapResult.formatted || ride.waypoints || DIRECT_ROUTE_LABEL,
+        waypointsList: mapResult.waypointsList,
       }
-    }).catch(console.warn)
-  }
+      save({
+        ...snapshot,
+        rides: snapshot.rides.map((r) => (r.id === ride.id ? updatedRide : r)),
+      })
+      if (isSupabaseConfigured()) {
+        supabaseCreateRide(updatedRide, input.driverId)
+          .then((inserted) => {
+            if (inserted?.id) {
+              const updatedRides = snapshot.rides.map((r) =>
+                r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
+              )
+              save({ ...snapshot, rides: updatedRides })
+            }
+          })
+          .catch(console.warn)
+      }
+    })
+    .catch(console.warn)
   return ride
 }
 

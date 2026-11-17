@@ -12,6 +12,11 @@ import type {
   DemoCarpoolRide,
   DemoCarpoolApplication,
 } from "./demoCarpoolFlow"
+import {
+  DIRECT_ROUTE_LABEL,
+  fetchRouteWaypointsFromMapBackend,
+  getExtractedWaypointsSync,
+} from "./routeWaypointService"
 
 // ============================================================================
 // 1. Auth Service
@@ -63,6 +68,31 @@ export async function supabaseSignUp(
     },
   })
   if (error) throw error
+
+  // 트리거 유무와 관계없이 클라이언트 레벨에서도 profiles 테이블에 즉시 upsert 보장
+  if (data?.user?.id) {
+    try {
+      await supabase.from("profiles").upsert(
+        {
+          id: data.user.id,
+          email,
+          name: metadata.name,
+          phone: metadata.phone || "010-0000-0000",
+          gender: metadata.gender || "선택 안 함",
+          role: metadata.role,
+          is_driver_verified: Boolean(metadata.isDriverVerified),
+          license_file_name: metadata.licenseFileName || "",
+          vehicle_name: metadata.vehicleName || "",
+          vehicle_capacity: metadata.vehicleCapacity || 5,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "id" },
+      )
+    } catch (profileErr) {
+      console.warn("Direct profile upsert on signUp fallback:", profileErr)
+    }
+  }
+
   return data
 }
 
@@ -141,11 +171,34 @@ export async function supabaseGetCurrentUser() {
 }
 
 // ============================================================================
-// 2. Profiles Service
+// 2. Profiles Service & Realtime
 // ============================================================================
 
-export async function supabaseGetProfile(userId: string) {
-  if (!isSupabaseConfigured()) return null
+export function profileRowToAccountData(
+  row: any,
+  fallbackEmail?: string,
+  loginIdFallback?: string,
+): AccountData {
+  const cleanId = row.id || loginIdFallback || ""
+  const cleanEmail = row.email || fallbackEmail || ""
+  const defaultLoginId = loginIdFallback || (cleanEmail ? cleanEmail.split("@")[0] : cleanId)
+  return {
+    id: cleanId,
+    loginId: defaultLoginId,
+    name: row.name || (cleanEmail ? cleanEmail.split("@")[0] : "사용자"),
+    email: cleanEmail,
+    phone: row.phone || "",
+    gender: row.gender || "선택 안 함",
+    role: row.role || "rider",
+    isDriverVerified: Boolean(row.is_driver_verified),
+    licenseFileName: row.license_file_name || undefined,
+    vehicleName: row.vehicle_name || undefined,
+    vehicleCapacity: row.vehicle_capacity ? Number(row.vehicle_capacity) : undefined,
+  }
+}
+
+export async function supabaseGetProfile(userId: string): Promise<AccountData | null> {
+  if (!isSupabaseConfigured() || !userId) return null
   try {
     const { data, error } = await supabase
       .from("profiles")
@@ -153,7 +206,8 @@ export async function supabaseGetProfile(userId: string) {
       .eq("id", userId)
       .maybeSingle()
     if (error) throw error
-    return data
+    if (!data) return null
+    return profileRowToAccountData(data)
   } catch (err) {
     console.warn("supabaseGetProfile failed:", err)
     return null
@@ -164,22 +218,68 @@ export async function supabaseUpdateProfile(
   userId: string,
   account: Partial<AccountData>,
 ) {
-  if (!isSupabaseConfigured()) return false
+  if (!isSupabaseConfigured() || !userId) return false
   try {
+    const updates: Record<string, any> = {
+      updated_at: new Date().toISOString(),
+    }
+    if (account.name !== undefined) updates.name = account.name
+    if (account.phone !== undefined) updates.phone = account.phone
+    if (account.gender !== undefined) updates.gender = account.gender
+    if (account.role !== undefined) updates.role = account.role
+    if (account.isDriverVerified !== undefined)
+      updates.is_driver_verified = Boolean(account.isDriverVerified)
+    if (account.licenseFileName !== undefined)
+      updates.license_file_name = account.licenseFileName
+    if (account.vehicleName !== undefined)
+      updates.vehicle_name = account.vehicleName
+    if (account.vehicleCapacity !== undefined)
+      updates.vehicle_capacity = Number(account.vehicleCapacity) || 5
+
     const { error } = await supabase
       .from("profiles")
-      .update({
-        name: account.name,
-        phone: account.phone,
-        gender: account.gender,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updates)
       .eq("id", userId)
     if (error) throw error
     return true
   } catch (err) {
     console.warn("supabaseUpdateProfile failed:", err)
     return false
+  }
+}
+
+/**
+ * Supabase Realtime 구독: profiles 테이블의 해당 유저 데이터 변경 시 즉시 콜백 호출
+ */
+export function subscribeUserProfileRealtime(
+  userId: string,
+  onUpdate: (profile: AccountData) => void,
+): () => void {
+  if (!isSupabaseConfigured() || !userId) {
+    return () => {}
+  }
+
+  const channel = supabase
+    .channel(`realtime:profiles:${userId}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "profiles",
+        filter: `id=eq.${userId}`,
+      },
+      (payload) => {
+        if (payload.new && typeof payload.new === "object") {
+          const updated = profileRowToAccountData(payload.new)
+          onUpdate(updated)
+        }
+      },
+    )
+    .subscribe()
+
+  return () => {
+    void supabase.removeChannel(channel)
   }
 }
 
@@ -197,10 +297,16 @@ export async function supabaseGetRoute(userId: string, role: Role): Promise<Rout
       .eq("role", role)
       .maybeSingle()
     if (error || !data) return null
+    const extracted = getExtractedWaypointsSync(
+      data.start_point || "",
+      data.destination || "",
+      data.waypoint || "",
+    )
     return {
       start: data.start_point,
       destination: data.destination,
-      waypoint: data.waypoint || "",
+      waypoint: extracted.formatted,
+      waypointsList: extracted.waypointsList,
       pickup: data.pickup || "",
       weekdays: data.weekdays || ["월", "화", "수", "목", "금"],
       departureTime: data.departure_time,
@@ -221,13 +327,23 @@ export async function supabaseSaveRoute(
 ) {
   if (!isSupabaseConfigured()) return false
   try {
+    const mapResult = await fetchRouteWaypointsFromMapBackend({
+      start: route.start,
+      destination: route.destination,
+      fallbackWaypoints: route.waypointsList ?? route.waypoint,
+    })
+    const resolvedWaypoint =
+      mapResult.waypointsList.length > 0
+        ? mapResult.formatted
+        : route.waypoint || DIRECT_ROUTE_LABEL
+
     const { error } = await supabase.from("routes").upsert(
       {
         user_id: userId,
         role,
         start_point: route.start,
         destination: route.destination,
-        waypoint: route.waypoint,
+        waypoint: resolvedWaypoint,
         pickup: route.pickup,
         weekdays: route.weekdays,
         departure_time: route.departureTime,
@@ -258,30 +374,38 @@ export async function supabaseGetRides(): Promise<DemoCarpoolRide[]> {
       .select("*")
       .order("created_at", { ascending: false })
     if (error || !data) return []
-    return data.map((item) => ({
-      id: String(item.id),
-      driverId: "demo-driver",
-      driverName: item.driver_name,
-      start: item.start_point,
-      destination: item.destination,
-      date: item.date,
-      time: item.departure_time,
-      vehicle: item.car_info,
-      totalSeats: item.total_seats,
-      price: item.price,
-      note: item.note || "",
-      waypoints: item.waypoints || "",
-      estimatedDuration: item.estimated_duration || 25,
-      estimatedArrival: item.arrival_time,
-      arrivalTimeManual: false,
-      smokingPreference: item.smoking_preference || "비흡연자 선호",
-      genderPreference: item.gender_preference || "성별 무관",
-      status: item.status,
-      settlementStatus: item.settlement_status,
-      endedAt: item.ended_at,
-      settledAt: item.settled_at,
-      createdAt: item.created_at,
-    }))
+    return data.map((item) => {
+      const extracted = getExtractedWaypointsSync(
+        item.start_point || "",
+        item.destination || "",
+        item.waypoints || "",
+      )
+      return {
+        id: String(item.id),
+        driverId: item.driver_id ? String(item.driver_id) : "demo-driver",
+        driverName: item.driver_name,
+        start: item.start_point,
+        destination: item.destination,
+        date: item.date,
+        time: item.departure_time,
+        vehicle: item.car_info,
+        totalSeats: item.total_seats,
+        price: item.price,
+        note: item.note || "",
+        waypoints: extracted.formatted || DIRECT_ROUTE_LABEL,
+        waypointsList: extracted.waypointsList,
+        estimatedDuration: item.estimated_duration || 25,
+        estimatedArrival: item.arrival_time,
+        arrivalTimeManual: false,
+        smokingPreference: item.smoking_preference || "비흡연자 선호",
+        genderPreference: item.gender_preference || "성별 무관",
+        status: item.status,
+        settlementStatus: item.settlement_status,
+        endedAt: item.ended_at,
+        settledAt: item.settled_at,
+        createdAt: item.created_at,
+      }
+    })
   } catch (err) {
     console.warn("supabaseGetRides failed:", err)
     return []

@@ -135,12 +135,37 @@ import {
   supabaseSignOut,
   supabaseResetPassword,
   supabaseGetCurrentUser,
+  supabaseGetProfile,
   supabaseSaveRoute,
   supabaseUpdateProfile,
+  subscribeUserProfileRealtime,
   supabaseSendSchoolEmailOtp,
   supabaseVerifySchoolEmailOtp,
 } from "./services/supabaseService"
-import { isSupabaseConfigured } from "./lib/supabase"
+import {
+  DIRECT_ROUTE_LABEL,
+  fetchRouteWaypointsFromMapBackend,
+  getExtractedWaypointsSync,
+  type WaypointNode,
+} from "./services/routeWaypointService"
+import {
+  formatChatRoomListTime,
+  formatChatTimestamp,
+  getCounterpartProfile,
+  getMessagesForRoom,
+  getOrCreateCarpoolChatRoom,
+  getRealtimeChatSnapshot,
+  getRoomsForUser,
+  leaveRealtimeChatRoom,
+  normalizeDisplayName,
+  sendRealtimeChatMessage,
+  subscribeRealtimeChat,
+  type CreateOrJoinChatParams,
+  type RealtimeChatRoom,
+} from "./services/realtimeChatService"
+import { supabase, isSupabaseConfigured } from "./lib/supabase"
+import GlobalDialog from "./components/GlobalDialog"
+import { showAppAlert, showAppConfirm } from "./services/dialogService"
 import JsBarcode from "jsbarcode"
 import type {
   AccountData,
@@ -166,11 +191,14 @@ const formatPoints = (value: number) => `${value.toLocaleString("ko-KR")} P`
 type MatchRide = {
   id: string
   flowRideId?: string
+  driverId?: string
   name: string
   car: string
   start: string
   end: string
   via: string
+  waypointsList?: string[]
+  waypointObjects?: WaypointNode[]
   date: string
   time: string
   estimatedDuration: number
@@ -191,9 +219,14 @@ const toMatchRide = (ride: Ride): MatchRide => {
     2,
     "0",
   )}:${String(departureMinutes % 60).padStart(2, "0")}`
+  const extracted = getExtractedWaypointsSync(ride.start, ride.end, ride.via)
   return {
     ...ride,
     id: `demo-${ride.id}`,
+    driverId: `driver-${ride.name}`,
+    via: extracted.formatted || DIRECT_ROUTE_LABEL,
+    waypointsList: extracted.waypointsList,
+    waypointObjects: extracted.waypointObjects,
     date: new Date().toLocaleDateString("ko-KR", {
       month: "long",
       day: "numeric",
@@ -209,27 +242,37 @@ const toMatchRide = (ride: Ride): MatchRide => {
 const toFlowMatchRide = (
   ride: DemoCarpoolRide,
   carpoolFlow: DemoCarpoolState,
-): MatchRide => ({
-  id: `flow-${ride.id}`,
-  flowRideId: ride.id,
-  name: ride.driverName,
-  car: ride.vehicle,
-  start: ride.start,
-  end: ride.destination,
-  via: ride.waypoints || "등록된 주요 경유지 없음",
-  date: new Date(`${ride.date}T00:00:00`).toLocaleDateString("ko-KR", {
-    month: "long",
-    day: "numeric",
-  }),
-  time: ride.time,
-  estimatedDuration: ride.estimatedDuration,
-  estimatedArrival: ride.estimatedArrival,
-  seats: getRemainingSeats(carpoolFlow, ride.id),
-  price: ride.price,
-  match: 99,
-  rating: 4.9,
-  reviews: 24,
-})
+): MatchRide => {
+  const extracted = getExtractedWaypointsSync(
+    ride.start,
+    ride.destination,
+    ride.waypointsList ?? ride.waypoints,
+  )
+  return {
+    id: `flow-${ride.id}`,
+    flowRideId: ride.id,
+    driverId: ride.driverId || `driver-${ride.driverName}`,
+    name: ride.driverName,
+    car: ride.vehicle,
+    start: ride.start,
+    end: ride.destination,
+    via: extracted.formatted || DIRECT_ROUTE_LABEL,
+    waypointsList: extracted.waypointsList,
+    waypointObjects: extracted.waypointObjects,
+    date: new Date(`${ride.date}T00:00:00`).toLocaleDateString("ko-KR", {
+      month: "long",
+      day: "numeric",
+    }),
+    time: ride.time,
+    estimatedDuration: ride.estimatedDuration,
+    estimatedArrival: ride.estimatedArrival,
+    seats: getRemainingSeats(carpoolFlow, ride.id),
+    price: ride.price,
+    match: 99,
+    rating: 4.9,
+    reviews: 24,
+  }
+}
 
 const getVisibleMatchRides = (
   route: RouteData,
@@ -378,6 +421,30 @@ function BadgeGlyph({ badge }: { badge: ProfileBadge }) {
   return <ShieldCheck />
 }
 
+/**
+ * 휴대폰 번호 유효성 검사 (하이픈 유무 무관, 순수 숫자 기준 한국 휴대폰 10~11자리)
+ */
+function isValidPhoneNumber(raw: string): boolean {
+  if (!raw) return false
+  const digits = raw.replace(/[^0-9]/g, "")
+  return /^01[016789]\d{7,8}$/.test(digits)
+}
+
+/**
+ * 휴대폰 번호 표준 포맷 정규화 (010-XXXX-XXXX 또는 01X-XXX-XXXX)
+ */
+function normalizePhoneNumber(raw: string): string {
+  if (!raw) return ""
+  const digits = raw.replace(/[^0-9]/g, "")
+  if (digits.length === 11) {
+    return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7)}`
+  }
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`
+  }
+  return raw.trim()
+}
+
 const WEEKDAY_NAMES_KO = ["일", "월", "화", "수", "목", "금", "토"] as const
 
 function getTodayDateKey(): string {
@@ -402,27 +469,46 @@ function parseTime24(value?: string): {
   hour12: number
   minute: number
   formatted24: string
+  totalMinutes: number
 } {
   const raw = (value || "08:30").trim()
   const match24 = raw.match(/^(\d{1,2}):(\d{2})$/)
   let h24 = 8
   let min = 30
   if (match24) {
-    h24 = Math.max(0, Math.min(23, Number(match24[1])))
-    min = Math.max(0, Math.min(59, Number(match24[2])))
+    const parsedH = Number(match24[1])
+    const parsedM = Number(match24[2])
+    h24 = Number.isFinite(parsedH) ? Math.max(0, Math.min(23, parsedH)) : 8
+    min = Number.isFinite(parsedM) ? Math.max(0, Math.min(59, parsedM)) : 30
   } else {
     const matchKo = raw.match(/(오전|오후)\s*(\d{1,2}):(\d{2})/)
     if (matchKo) {
       let parsedH = Number(matchKo[2]) % 12
       if (matchKo[1] === "오후") parsedH += 12
-      h24 = Math.max(0, Math.min(23, parsedH))
-      min = Math.max(0, Math.min(59, Number(matchKo[3])))
+      const parsedM = Number(matchKo[3])
+      h24 = Number.isFinite(parsedH) ? Math.max(0, Math.min(23, parsedH)) : 8
+      min = Number.isFinite(parsedM) ? Math.max(0, Math.min(59, parsedM)) : 30
     }
   }
-  const meridiem: "오전" | "오후" = h24 >= 12 ? "오후" : "오전"
-  const hour12 = h24 % 12 === 0 ? 12 : h24 % 12
-  const formatted24 = `${String(h24).padStart(2, "0")}:${String(min).padStart(2, "0")}`
-  return { meridiem, hour12, minute: min, formatted24 }
+  const totalMinutes = Math.max(0, Math.min(1439, h24 * 60 + min))
+  const safeH24 = Math.floor(totalMinutes / 60)
+  const safeMin = totalMinutes % 60
+  const meridiem: "오전" | "오후" = safeH24 >= 12 ? "오후" : "오전"
+  const hour12 = safeH24 % 12 === 0 ? 12 : safeH24 % 12
+  const formatted24 = `${String(safeH24).padStart(2, "0")}:${String(safeMin).padStart(2, "0")}`
+  return { meridiem, hour12, minute: safeMin, formatted24, totalMinutes }
+}
+
+function toTotalMinutes24(value?: string): number {
+  return parseTime24(value).totalMinutes
+}
+
+function minutesToTime24(totalMinutes: number): string {
+  if (!Number.isFinite(totalMinutes)) return "08:30"
+  const clamped = Math.max(0, Math.min(1439, Math.round(totalMinutes)))
+  const nextH = Math.floor(clamped / 60)
+  const nextM = clamped % 60
+  return `${String(nextH).padStart(2, "0")}:${String(nextM).padStart(2, "0")}`
 }
 
 function toTime24String(
@@ -434,7 +520,8 @@ function toTime24String(
   const safeMinute = Math.max(0, Math.min(59, Math.round(minute) || 0))
   let h24 = safeHour12 % 12
   if (meridiem === "오후") h24 += 12
-  return `${String(h24).padStart(2, "0")}:${String(safeMinute).padStart(2, "0")}`
+  const total = Math.max(0, Math.min(1439, h24 * 60 + safeMinute))
+  return minutesToTime24(total)
 }
 
 function formatKoreanTimeLabel(value?: string): string {
@@ -443,12 +530,54 @@ function formatKoreanTimeLabel(value?: string): string {
 }
 
 function addMinutesToTime24(value: string, deltaMinutes: number): string {
-  const { formatted24 } = parseTime24(value)
-  const [h, m] = formatted24.split(":").map(Number)
-  const total = ((h * 60 + m + deltaMinutes) % 1440 + 1440) % 1440
-  const nextH = Math.floor(total / 60)
-  const nextM = total % 60
-  return `${String(nextH).padStart(2, "0")}:${String(nextM).padStart(2, "0")}`
+  const baseMinutes = toTotalMinutes24(value)
+  const safeDelta = Number.isFinite(deltaMinutes) ? Math.round(deltaMinutes) : 0
+  return minutesToTime24(Math.max(0, Math.min(1439, baseMinutes + safeDelta)))
+}
+
+function isValidDepartureAndArrival(
+  departureTime24?: string,
+  arrivalTime24?: string,
+): boolean {
+  if (!departureTime24 || !arrivalTime24) return false
+  const depMinutes = toTotalMinutes24(departureTime24)
+  const arrMinutes = toTotalMinutes24(arrivalTime24)
+  return depMinutes < arrMinutes
+}
+
+function resolveValidArrivalTime24(
+  departureTime24: string,
+  currentArrivalTime24?: string,
+): {
+  departure24: string
+  arrival24: string
+  autoAdjusted: boolean
+} {
+  const rawDepMin = toTotalMinutes24(departureTime24)
+  // 하루 마지막 시간(23:59 = 1439분)에 도착 시간이 최소 1분 이후가 될 수 있도록 출발 시간은 최대 23:58(1438분)으로 안전 보정
+  const safeDepMin = Math.max(0, Math.min(1438, rawDepMin))
+  const safeDep24 = minutesToTime24(safeDepMin)
+  const currentArrMin = currentArrivalTime24
+    ? toTotalMinutes24(currentArrivalTime24)
+    : -1
+
+  if (currentArrMin > safeDepMin && currentArrMin <= 1439) {
+    return {
+      departure24: safeDep24,
+      arrival24: minutesToTime24(currentArrMin),
+      autoAdjusted: safeDepMin !== rawDepMin,
+    }
+  }
+
+  let nextArrMin = safeDepMin + 30
+  if (nextArrMin > 1439) {
+    nextArrMin = safeDepMin + 10 <= 1439 ? safeDepMin + 10 : 1439
+  }
+  return {
+    departure24: safeDep24,
+    arrival24: minutesToTime24(nextArrMin),
+    autoAdjusted: true,
+  }
 }
 
 function CustomDatePickerModal({
@@ -593,21 +722,534 @@ function CustomDatePickerModal({
   )
 }
 
+type PublicUserProfileTarget = {
+  id?: string
+  name?: string
+  role?: Role
+  emailVerified?: boolean
+  licenseVerified?: boolean
+  rating?: number
+  tripCount?: number
+  carInfo?: string
+  badges?: string[]
+  reviews?: DemoReview[]
+}
+
+type PublicUserProfileData = {
+  id: string
+  name: string
+  role: Role
+  emailVerified: boolean
+  licenseVerified: boolean
+  rating: number
+  tripCount: number
+  carInfo: string
+  badges: string[]
+  reviews: DemoReview[]
+}
+
+const DEMO_USER_PROFILES_DB: Record<string, Partial<PublicUserProfileData>> = {
+  김도윤: {
+    name: "김도윤",
+    role: "driver",
+    emailVerified: true,
+    licenseVerified: true,
+    rating: 4.9,
+    tripCount: 28,
+    carInfo: "흰색 현대 아반떼 · 12가 3456",
+    badges: ["친절한 드라이버", "시간 엄수", "안전운전", "차량 청결"],
+    reviews: [
+      {
+        author: "박민지",
+        date: "2026. 11. 15.",
+        score: 5,
+        text: "출발 시간을 정확히 지켜주시고 운전이 정말 부드러워서 편하게 등교했어요!",
+        tags: ["시간을 잘 지켜요", "안전하게 운전해요"],
+      },
+      {
+        author: "이서연",
+        date: "2026. 11. 12.",
+        score: 5,
+        text: "차량 내부가 깔끔하고 인사도 밝게 해주셔서 아침 통학길이 즐거웠습니다.",
+        tags: ["친절해요", "차량이 깨끗해요"],
+      },
+      {
+        author: "정우진",
+        date: "2026. 11. 08.",
+        score: 4.8,
+        text: "모란역 승차 위치 안내를 미리 채팅으로 자세히 알려주셔서 찾기 쉬웠어요.",
+        tags: ["소통이 원활해요", "친절해요"],
+      },
+    ],
+  },
+  박민지: {
+    name: "박민지",
+    role: "rider",
+    emailVerified: true,
+    licenseVerified: false,
+    rating: 4.9,
+    tripCount: 16,
+    carInfo: "",
+    badges: ["매너 탑승자", "시간 엄수", "빠른 응답"],
+    reviews: [
+      {
+        author: "김도윤 운전자",
+        date: "2026. 11. 15.",
+        score: 5,
+        text: "약속 시간 5분 전에 미리 나와 계셔서 지체 없이 바로 출발할 수 있었습니다.",
+        tags: ["약속 시간을 잘 지켜요", "친절하고 매너가 좋아요"],
+      },
+      {
+        author: "최준호 운전자",
+        date: "2026. 11. 09.",
+        score: 5,
+        text: "채팅 응답이 빠르고 정산도 도착하자마자 바로 처리해 주셨어요.",
+        tags: ["소통이 원활해요", "탑승 규칙을 잘 지켜요"],
+      },
+    ],
+  },
+  이서연: {
+    name: "이서연",
+    role: "rider",
+    emailVerified: true,
+    licenseVerified: false,
+    rating: 4.8,
+    tripCount: 11,
+    carInfo: "",
+    badges: ["매너 탑승자", "시간 엄수", "친절한 소통"],
+    reviews: [
+      {
+        author: "김도윤 운전자",
+        date: "2026. 11. 12.",
+        score: 5,
+        text: "밝게 인사해주시고 탑승 매너가 아주 좋으신 학우님입니다.",
+        tags: ["친절하고 매너가 좋아요"],
+      },
+    ],
+  },
+  정우진: {
+    name: "정우진",
+    role: "rider",
+    emailVerified: true,
+    licenseVerified: false,
+    rating: 4.7,
+    tripCount: 7,
+    carInfo: "",
+    badges: ["시간 엄수", "빠른 응답"],
+    reviews: [
+      {
+        author: "김도윤 운전자",
+        date: "2026. 11. 08.",
+        score: 4.8,
+        text: "탑승 위치에서 정확히 대기해주셔서 원활하게 운행했습니다.",
+        tags: ["약속 시간을 잘 지켜요"],
+      },
+    ],
+  },
+  최준호: {
+    name: "최준호",
+    role: "driver",
+    emailVerified: true,
+    licenseVerified: true,
+    rating: 4.8,
+    tripCount: 19,
+    carInfo: "검정 기아 K3 · 34나 7890",
+    badges: ["안전운전", "시간 엄수", "친절한 드라이버"],
+    reviews: [
+      {
+        author: "박민지",
+        date: "2026. 11. 09.",
+        score: 5,
+        text: "급정거 없이 안전하게 운전해 주셔서 편안했습니다!",
+        tags: ["안전하게 운전해요", "시간을 잘 지켜요"],
+      },
+    ],
+  },
+}
+
+function resolvePublicUserProfile(
+  target: PublicUserProfileTarget | null,
+  carpoolFlow?: DemoCarpoolState,
+  currentAccount?: AccountData,
+): PublicUserProfileData | null {
+  if (!target) return null
+  const rawName = (target.name || "익명 학우").trim()
+  const cleanName = rawName
+    .replace(/\s*(운전자|탑승자|탑승 신청|학우|기사님|·.*)\s*$/g, "")
+    .trim() || rawName
+
+  const preset = DEMO_USER_PROFILES_DB[cleanName]
+  const resolvedRole: Role =
+    target.role || preset?.role || (target.carInfo ? "driver" : "rider")
+
+  const isCurrentUser =
+    Boolean(currentAccount?.name) &&
+    currentAccount?.name.trim() === cleanName
+
+  const flowRideForDriver = carpoolFlow?.rides?.find(
+    (item) => item?.driverName?.trim() === cleanName,
+  )
+  const flowReviewsForDriver: DemoReview[] =
+    resolvedRole === "driver" && carpoolFlow?.reviews
+      ? carpoolFlow.reviews
+          .filter((rev) => {
+            const r = carpoolFlow.rides.find((item) => item.id === rev.rideId)
+            return r?.driverName?.trim() === cleanName
+          })
+          .map((rev) => ({
+            author: "탑승 학우",
+            date: new Date(rev.createdAt).toLocaleDateString("ko-KR"),
+            score: Number.isFinite(rev.rating) ? rev.rating : 5,
+            text: rev.content || "안전하고 쾌적한 카풀이었습니다.",
+            tags: Array.isArray(rev.keywords) ? rev.keywords : [],
+          }))
+      : []
+
+  const baseReviews = Array.isArray(target.reviews)
+    ? target.reviews
+    : Array.isArray(preset?.reviews)
+      ? preset.reviews
+      : []
+
+  const mergedReviews = isCurrentUser ? flowReviewsForDriver : [...flowReviewsForDriver, ...baseReviews]
+  const calculatedRating = isCurrentUser
+    ? flowReviewsForDriver.length > 0
+      ? Number(
+          (
+            flowReviewsForDriver.reduce(
+              (acc, item) => acc + (Number(item?.score) || 5),
+              0,
+            ) / flowReviewsForDriver.length
+          ).toFixed(1),
+        )
+      : 0.0
+    : typeof target.rating === "number" && Number.isFinite(target.rating) && target.rating > 0
+      ? target.rating
+      : typeof preset?.rating === "number" && Number.isFinite(preset.rating)
+        ? preset.rating
+        : mergedReviews.length > 0
+          ? Number(
+              (
+                mergedReviews.reduce(
+                  (acc, item) => acc + (Number(item?.score) || 5),
+                  0,
+                ) / mergedReviews.length
+              ).toFixed(1),
+            )
+          : 0.0
+
+  const defaultBadges = isCurrentUser
+    ? (currentAccount?.isDriverVerified ? ["driver-license"] : [])
+    : resolvedRole === "driver"
+      ? ["친절한 드라이버", "시간 엄수", "안전운전"]
+      : ["매너 탑승자", "시간 엄수", "빠른 응답"]
+
+  const badges = Array.isArray(target.badges)
+    ? target.badges
+    : isCurrentUser
+      ? defaultBadges
+      : Array.isArray(preset?.badges)
+        ? preset.badges
+        : defaultBadges
+
+  const rawCarInfo =
+    target.carInfo?.trim() ||
+    flowRideForDriver?.vehicle?.trim() ||
+    (isCurrentUser ? currentAccount?.vehicleName?.trim() : "") ||
+    preset?.carInfo?.trim() ||
+    ""
+
+  const tripCount = isCurrentUser
+    ? flowRidesForDriver.length
+    : typeof target.tripCount === "number" && Number.isFinite(target.tripCount)
+      ? target.tripCount
+      : typeof preset?.tripCount === "number"
+        ? preset.tripCount
+        : 0
+
+  return {
+    id: target.id || `user-${cleanName}`,
+    name: cleanName,
+    role: resolvedRole,
+    emailVerified: target.emailVerified ?? preset?.emailVerified ?? true,
+    licenseVerified:
+      resolvedRole === "driver"
+        ? (target.licenseVerified ??
+          (isCurrentUser ? Boolean(currentAccount?.isDriverVerified ?? true) : true))
+        : false,
+    rating: calculatedRating,
+    tripCount,
+    carInfo: resolvedRole === "driver" ? rawCarInfo : "",
+    badges,
+    reviews: mergedReviews,
+  }
+}
+
+function UserProfileDetailModal({
+  profile,
+  onClose,
+  onSelectUserProfile,
+}: {
+  profile: PublicUserProfileData | null
+  onClose: () => void
+  onSelectUserProfile?: (target: PublicUserProfileTarget) => void
+}) {
+  if (!profile) return null
+  const isDriver = profile.role === "driver"
+  const safeBadges = Array.isArray(profile.badges) ? profile.badges : []
+  const safeReviews = Array.isArray(profile.reviews) ? profile.reviews : []
+  const safeRating =
+    typeof profile.rating === "number" && Number.isFinite(profile.rating)
+      ? profile.rating
+      : 0.0
+  const safeCarInfo = profile.carInfo?.trim() || "차량 정보 미등록"
+
+  return (
+    <div
+      className="dialog-backdrop flow-dialog-backdrop user-profile-modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      <section
+        className="app-dialog user-profile-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${profile.name}님의 상세 프로필`}
+      >
+        <header className="user-profile-modal__header">
+          <span className="eyebrow">
+            {isDriver ? "DRIVER PROFILE" : "PASSENGER PROFILE"}
+          </span>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={onClose}
+            aria-label="프로필 창 닫기"
+          >
+            <X />
+          </button>
+        </header>
+
+        <div className="user-profile-modal__top">
+          <div className={`profile-avatar ${isDriver ? "" : "green"}`}>
+            {(profile.name || "학").slice(0, 1)}
+            <span>
+              <ShieldCheck />
+            </span>
+          </div>
+          <div className="user-profile-modal__identity">
+            <div className="user-profile-modal__name-row">
+              <h2>{profile.name || "학우"}</h2>
+              <span className={`role-pill ${profile.role}`}>
+                {isDriver ? "운전자" : "탑승자"}
+              </span>
+            </div>
+            <div className="user-profile-modal__verifications">
+              {profile.emailVerified && (
+                <span className="verified-text">
+                  <Check /> 학교 이메일 인증
+                </span>
+              )}
+              {isDriver && profile.licenseVerified && (
+                <span className="verified-text verified-text--driver">
+                  <ShieldCheck /> 운전면허증 인증
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {isDriver ? (
+          <>
+            <div className="user-profile-modal__stats">
+              <div>
+                <strong className="rating-score">
+                  <Star /> {safeRating.toFixed(1)} <small>/ 5.0</small>
+                </strong>
+                <span>평균 별점</span>
+              </div>
+              <div>
+                <strong>{safeReviews.length}개</strong>
+                <span>총 후기 수</span>
+              </div>
+              <div>
+                <strong>{profile.tripCount ?? 0}회</strong>
+                <span>운행 횟수</span>
+              </div>
+            </div>
+
+            <section className="user-profile-modal__section">
+              <h3>등록 차량 정보</h3>
+              <div className="user-profile-modal__car-card">
+                <CarFront />
+                <div>
+                  <span>차종 및 차량 번호</span>
+                  <strong>{safeCarInfo}</strong>
+                </div>
+              </div>
+            </section>
+          </>
+        ) : (
+          <div className="user-profile-modal__stats rider-stats">
+            <div>
+              <strong>{profile.tripCount ?? 0}회</strong>
+              <span>카풀 탑승 완료</span>
+            </div>
+            <div>
+              <strong className="rating-score">
+                <Star /> {safeRating.toFixed(1)} <small>/ 5.0</small>
+              </strong>
+              <span>매너 평점</span>
+            </div>
+            <div>
+              <strong>{safeReviews.length}개</strong>
+              <span>받은 후기</span>
+            </div>
+          </div>
+        )}
+
+        <section className="user-profile-modal__section">
+          <h3>획득 뱃지</h3>
+          {safeBadges.length > 0 ? (
+            <div className="user-profile-modal__badges">
+              {safeBadges.map((badgeLabel, idx) => (
+                <span
+                  className={`profile-badge ${
+                    idx % 3 === 0
+                      ? "tone-green"
+                      : idx % 3 === 1
+                        ? "tone-sky"
+                        : "tone-navy"
+                  }`}
+                  key={`${badgeLabel}-${idx}`}
+                >
+                  {isDriver ? <ShieldCheck /> : <Check />}
+                  {badgeLabel}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div className="user-profile-modal__empty">
+              아직 획득한 뱃지가 없습니다.
+            </div>
+          )}
+        </section>
+
+        <section className="user-profile-modal__section">
+          <div className="user-profile-modal__section-head">
+            <h3>{isDriver ? "받은 운행 후기" : "받은 탑승 후기"}</h3>
+            <span>총 {safeReviews.length}건</span>
+          </div>
+          {safeReviews.length > 0 ? (
+            <div className="user-profile-reviews-scroll">
+              {safeReviews.map((rev, idx) => (
+                <article
+                  className="user-profile-review-item"
+                  key={`${rev?.author || "익명"}-${rev?.date || idx}-${idx}`}
+                >
+                  <div className="user-profile-review-item__top">
+                    <strong
+                      className={
+                        onSelectUserProfile ? "clickable-profile-inline" : ""
+                      }
+                      role={onSelectUserProfile ? "button" : undefined}
+                      tabIndex={onSelectUserProfile ? 0 : undefined}
+                      onClick={(event) => {
+                        if (!onSelectUserProfile) return
+                        event.stopPropagation()
+                        onSelectUserProfile({
+                          name: rev?.author || "익명 학우",
+                          role: isDriver ? "rider" : "driver",
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (
+                          onSelectUserProfile &&
+                          (event.key === "Enter" || event.key === " ")
+                        ) {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onSelectUserProfile({
+                            name: rev?.author || "익명 학우",
+                            role: isDriver ? "rider" : "driver",
+                          })
+                        }
+                      }}
+                    >
+                      {rev?.author || "익명 학우"}
+                    </strong>
+                    <span>
+                      <Star /> {(Number(rev?.score) || 5).toFixed(1)} ·{" "}
+                      {rev?.date || "최근"}
+                    </span>
+                  </div>
+                  <p>{rev?.text || "작성된 후기 내용이 없습니다."}</p>
+                  {Array.isArray(rev?.tags) && rev.tags.length > 0 && (
+                    <div className="review-tags">
+                      {rev.tags.map((tag) => (
+                        <span key={tag}>{tag}</span>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="user-profile-modal__empty">
+              아직 등록된 후기가 없습니다.
+            </div>
+          )}
+        </section>
+
+        <Button type="button" onClick={onClose}>
+          닫기
+        </Button>
+      </section>
+    </div>
+  )
+}
+
 function CustomTimePickerModal({
   isOpen,
   value,
+  arrivalValue,
+  minTime24,
+  maxTime24,
   title = "시간 설정",
   subtitle = "변경한 시간은 기본 경로와 모든 예약·일정 데이터에 즉시 동기화됩니다.",
   onClose,
   onConfirm,
+  onConfirmRange,
 }: {
   isOpen: boolean
   value: string
+  arrivalValue?: string
+  minTime24?: string
+  maxTime24?: string
   title?: string
   subtitle?: string
   onClose: () => void
   onConfirm: (nextTime24: string) => void
+  onConfirmRange?: (nextDeparture24: string, nextArrival24: string) => void
 }) {
+  const isDualMode = typeof onConfirmRange === "function"
+  const [activeField, setActiveField] = useState<"departure" | "arrival">(
+    "departure",
+  )
+  const [draftDeparture24, setDraftDeparture24] = useState(() =>
+    minutesToTime24(Math.min(1438, toTotalMinutes24(value))),
+  )
+  const [draftArrival24, setDraftArrival24] = useState(() => {
+    const resolved = resolveValidArrivalTime24(
+      value || "08:30",
+      arrivalValue || addMinutesToTime24(value || "08:30", 30),
+    )
+    return resolved.arrival24
+  })
+  const [autoAdjustNotice, setAutoAdjustNotice] = useState("")
+  const [validationAlertMessage, setValidationAlertMessage] = useState("")
+
   const initialParsed = parseTime24(value)
   const [meridiem, setMeridiem] = useState<"오전" | "오후">(
     initialParsed.meridiem,
@@ -617,17 +1259,158 @@ function CustomTimePickerModal({
 
   useEffect(() => {
     if (!isOpen) return
-    const parsed = parseTime24(value)
-    setMeridiem(parsed.meridiem)
-    setHour12(parsed.hour12)
-    setMinute(parsed.minute)
-  }, [isOpen, value])
+    setActiveField("departure")
+    setAutoAdjustNotice("")
+    setValidationAlertMessage("")
+    if (isDualMode) {
+      const resolved = resolveValidArrivalTime24(
+        value || "08:30",
+        arrivalValue || addMinutesToTime24(value || "08:30", 30),
+      )
+      setDraftDeparture24(resolved.departure24)
+      setDraftArrival24(resolved.arrival24)
+      const parsedDep = parseTime24(resolved.departure24)
+      setMeridiem(parsedDep.meridiem)
+      setHour12(parsedDep.hour12)
+      setMinute(parsedDep.minute)
+    } else {
+      const parsed = parseTime24(value)
+      setMeridiem(parsed.meridiem)
+      setHour12(parsed.hour12)
+      setMinute(parsed.minute)
+    }
+  }, [arrivalValue, isDualMode, isOpen, value])
 
   if (!isOpen) return null
 
+  const effectiveMinMinutes = isDualMode
+    ? activeField === "arrival"
+      ? toTotalMinutes24(draftDeparture24)
+      : null
+    : minTime24
+      ? toTotalMinutes24(minTime24)
+      : null
+
+  const effectiveMaxMinutes = isDualMode
+    ? activeField === "departure"
+      ? 1438
+      : 1439
+    : maxTime24
+      ? toTotalMinutes24(maxTime24)
+      : 1439
+
+  const applySelectedParts = (
+    nextMeridiem: "오전" | "오후",
+    nextHour12: number,
+    nextMinute: number,
+  ) => {
+    const candidate24 = toTime24String(nextMeridiem, nextHour12, nextMinute)
+    const candidateMin = toTotalMinutes24(candidate24)
+
+    if (effectiveMinMinutes !== null && candidateMin <= effectiveMinMinutes) {
+      setValidationAlertMessage(
+        "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+      )
+      return
+    }
+
+    const clampedMin = Math.max(0, Math.min(effectiveMaxMinutes, candidateMin))
+    const final24 = minutesToTime24(clampedMin)
+    const finalParsed = parseTime24(final24)
+    setMeridiem(finalParsed.meridiem)
+    setHour12(finalParsed.hour12)
+    setMinute(finalParsed.minute)
+
+    if (isDualMode) {
+      if (activeField === "departure") {
+        const resolved = resolveValidArrivalTime24(final24, draftArrival24)
+        setDraftDeparture24(resolved.departure24)
+        setDraftArrival24(resolved.arrival24)
+        if (resolved.autoAdjusted) {
+          setAutoAdjustNotice(
+            `출발 시간이 기존 도착 시간과 같거나 늦어, 도착 시간이 ${formatKoreanTimeLabel(resolved.arrival24)}(${resolved.arrival24})으로 자동 조정되었습니다.`,
+          )
+        } else {
+          setAutoAdjustNotice("")
+        }
+      } else {
+        setDraftArrival24(final24)
+        setAutoAdjustNotice("")
+      }
+    }
+  }
+
+  const switchDualTab = (target: "departure" | "arrival") => {
+    setActiveField(target)
+    const source24 = target === "departure" ? draftDeparture24 : draftArrival24
+    const parsed = parseTime24(source24)
+    setMeridiem(parsed.meridiem)
+    setHour12(parsed.hour12)
+    setMinute(parsed.minute)
+  }
+
   const preview24 = toTime24String(meridiem, hour12, minute)
+  const previewMinutes = toTotalMinutes24(preview24)
   const previewKorean = `${meridiem} ${hour12}:${String(minute).padStart(2, "0")}`
   const minutePresets = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+
+  const isMeridiemDisabled = (targetMeridiem: "오전" | "오후") => {
+    if (effectiveMinMinutes === null) return false
+    // 오전의 마지막 시간은 11:59 (719분). 출발 시간이 719분 이상이면 오전 전체 선택 불가
+    if (targetMeridiem === "오전" && effectiveMinMinutes >= 719) return true
+    return false
+  }
+
+  const isHourDisabled = (h: number) => {
+    const maxMinInHour = toTotalMinutes24(toTime24String(meridiem, h, 59))
+    const minMinInHour = toTotalMinutes24(toTime24String(meridiem, h, 0))
+    if (effectiveMinMinutes !== null && maxMinInHour <= effectiveMinMinutes) {
+      return true
+    }
+    if (minMinInHour > effectiveMaxMinutes) {
+      return true
+    }
+    return false
+  }
+
+  const isMinuteDisabled = (m: number) => {
+    const candidateMin = toTotalMinutes24(toTime24String(meridiem, hour12, m))
+    if (effectiveMinMinutes !== null && candidateMin <= effectiveMinMinutes) {
+      return true
+    }
+    if (candidateMin > effectiveMaxMinutes) {
+      return true
+    }
+    return false
+  }
+
+  const handleConfirmClick = () => {
+    if (isDualMode && onConfirmRange) {
+      const depMin = toTotalMinutes24(draftDeparture24)
+      const arrMin = toTotalMinutes24(draftArrival24)
+      if (arrMin <= depMin) {
+        setValidationAlertMessage(
+          "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+        )
+        return
+      }
+      onConfirmRange(draftDeparture24, draftArrival24)
+      onClose()
+      return
+    }
+
+    if (effectiveMinMinutes !== null && previewMinutes <= effectiveMinMinutes) {
+      setValidationAlertMessage(
+        "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+      )
+      return
+    }
+    const safeFinal24 = minutesToTime24(
+      Math.max(0, Math.min(effectiveMaxMinutes, previewMinutes)),
+    )
+    onConfirm(safeFinal24)
+    onClose()
+  }
 
   return (
     <div
@@ -657,43 +1440,143 @@ function CustomTimePickerModal({
           </button>
         </div>
         {subtitle && <p className="custom-picker-sub">{subtitle}</p>}
-        <div className="time-picker-preview">
-          <Clock3 />
-          <div>
-            <span>선택된 시간</span>
-            <strong>
-              {previewKorean} <small>({preview24})</small>
-            </strong>
+        {isDualMode ? (
+          <div className="time-dual-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeField === "departure"}
+              className={activeField === "departure" ? "active" : ""}
+              onClick={() => switchDualTab("departure")}
+            >
+              <small>희망 출발 시간</small>
+              <strong>
+                {formatKoreanTimeLabel(draftDeparture24)} ({draftDeparture24})
+              </strong>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeField === "arrival"}
+              className={activeField === "arrival" ? "active" : ""}
+              onClick={() => switchDualTab("arrival")}
+            >
+              <small>희망 도착 시간</small>
+              <strong>
+                {formatKoreanTimeLabel(draftArrival24)} ({draftArrival24})
+              </strong>
+            </button>
           </div>
-        </div>
+        ) : (
+          <div className="time-picker-preview">
+            <Clock3 />
+            <div>
+              <span>
+                {effectiveMinMinutes !== null
+                  ? `선택된 도착 시간 (출발 ${minutesToTime24(effectiveMinMinutes)} 이후)`
+                  : "선택된 시간"}
+              </span>
+              <strong>
+                {previewKorean} <small>({preview24})</small>
+              </strong>
+            </div>
+          </div>
+        )}
+        {autoAdjustNotice && (
+          <div className="email-code-notice time-auto-adjust-banner">
+            <Clock3 />
+            <span>{autoAdjustNotice}</span>
+          </div>
+        )}
         <div className="time-picker-section">
           <span className="time-picker-label">오전 / 오후</span>
           <div className="time-meridiem-toggle">
-            {(["오전", "오후"] as const).map((item) => (
-              <button
-                type="button"
-                key={item}
-                className={meridiem === item ? "active" : ""}
-                onClick={() => setMeridiem(item)}
-              >
-                {item}
-              </button>
-            ))}
+            {(["오전", "오후"] as const).map((item) => {
+              const disabled = isMeridiemDisabled(item)
+              return (
+                <button
+                  type="button"
+                  key={item}
+                  disabled={disabled}
+                  className={meridiem === item ? "active" : ""}
+                  onClick={() => {
+                    if (disabled) {
+                      setValidationAlertMessage(
+                        "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                      )
+                      return
+                    }
+                    const candidateMin = toTotalMinutes24(
+                      toTime24String(item, hour12, minute),
+                    )
+                    if (
+                      effectiveMinMinutes !== null &&
+                      candidateMin <= effectiveMinMinutes
+                    ) {
+                      const safeNextMin = Math.min(
+                        1439,
+                        effectiveMinMinutes + 10 <= 1439
+                          ? effectiveMinMinutes + 10
+                          : effectiveMinMinutes + 1,
+                      )
+                      const nextParsed = parseTime24(minutesToTime24(safeNextMin))
+                      applySelectedParts(
+                        nextParsed.meridiem,
+                        nextParsed.hour12,
+                        nextParsed.minute,
+                      )
+                      return
+                    }
+                    applySelectedParts(item, hour12, minute)
+                  }}
+                >
+                  {item}
+                </button>
+              )
+            })}
           </div>
         </div>
         <div className="time-picker-section">
           <span className="time-picker-label">시 (Hour)</span>
           <div className="time-hour-grid">
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((h) => (
-              <button
-                type="button"
-                key={h}
-                className={hour12 === h ? "active" : ""}
-                onClick={() => setHour12(h)}
-              >
-                {h}시
-              </button>
-            ))}
+            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((h) => {
+              const disabled = isHourDisabled(h)
+              return (
+                <button
+                  type="button"
+                  key={h}
+                  disabled={disabled}
+                  className={hour12 === h ? "active" : ""}
+                  onClick={() => {
+                    if (disabled) {
+                      setValidationAlertMessage(
+                        "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                      )
+                      return
+                    }
+                    let nextMin = minute
+                    const candidateMin = toTotalMinutes24(
+                      toTime24String(meridiem, h, nextMin),
+                    )
+                    if (
+                      effectiveMinMinutes !== null &&
+                      candidateMin <= effectiveMinMinutes
+                    ) {
+                      const minRequired = Math.min(1439, effectiveMinMinutes + 5)
+                      const reqParsed = parseTime24(minutesToTime24(minRequired))
+                      nextMin =
+                        reqParsed.hour12 === h &&
+                        reqParsed.meridiem === meridiem
+                          ? reqParsed.minute
+                          : 59
+                    }
+                    applySelectedParts(meridiem, h, nextMin)
+                  }}
+                >
+                  {h}시
+                </button>
+              )
+            })}
           </div>
         </div>
         <div className="time-picker-section">
@@ -702,50 +1585,118 @@ function CustomTimePickerModal({
             <div className="time-minute-stepper">
               <button
                 type="button"
-                onClick={() => setMinute((prev) => (prev + 59) % 60)}
+                disabled={
+                  previewMinutes <= 0 ||
+                  (effectiveMinMinutes !== null &&
+                    previewMinutes - 1 <= effectiveMinMinutes)
+                }
+                onClick={() => {
+                  const nextTotal = Math.max(0, previewMinutes - 1)
+                  if (
+                    effectiveMinMinutes !== null &&
+                    nextTotal <= effectiveMinMinutes
+                  ) {
+                    setValidationAlertMessage(
+                      "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                    )
+                    return
+                  }
+                  const parsed = parseTime24(minutesToTime24(nextTotal))
+                  applySelectedParts(
+                    parsed.meridiem,
+                    parsed.hour12,
+                    parsed.minute,
+                  )
+                }}
               >
                 -1분
               </button>
               <strong>{String(minute).padStart(2, "0")}분</strong>
               <button
                 type="button"
-                onClick={() => setMinute((prev) => (prev + 1) % 60)}
+                disabled={previewMinutes >= effectiveMaxMinutes}
+                onClick={() => {
+                  const nextTotal = Math.min(
+                    effectiveMaxMinutes,
+                    previewMinutes + 1,
+                  )
+                  const parsed = parseTime24(minutesToTime24(nextTotal))
+                  applySelectedParts(
+                    parsed.meridiem,
+                    parsed.hour12,
+                    parsed.minute,
+                  )
+                }}
               >
                 +1분
               </button>
             </div>
           </div>
           <div className="time-minute-grid">
-            {minutePresets.map((m) => (
-              <button
-                type="button"
-                key={m}
-                className={minute === m ? "active" : ""}
-                onClick={() => setMinute(m)}
-              >
-                {String(m).padStart(2, "0")}분
-              </button>
-            ))}
+            {minutePresets.map((m) => {
+              const disabled = isMinuteDisabled(m)
+              return (
+                <button
+                  type="button"
+                  key={m}
+                  disabled={disabled}
+                  className={minute === m ? "active" : ""}
+                  onClick={() => {
+                    if (disabled) {
+                      setValidationAlertMessage(
+                        "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                      )
+                      return
+                    }
+                    applySelectedParts(meridiem, hour12, m)
+                  }}
+                >
+                  {String(m).padStart(2, "0")}분
+                </button>
+              )
+            })}
           </div>
         </div>
         <div className="dialog-actions">
           <Button type="button" variant="ghost" onClick={onClose}>
             취소
           </Button>
-          <Button
-            type="button"
-            onClick={() => {
-              onConfirm(preview24)
-              onClose()
-            }}
-          >
+          <Button type="button" onClick={handleConfirmClick}>
             적용 (확인)
           </Button>
         </div>
+        {validationAlertMessage && (
+          <div
+            className="dialog-backdrop flow-dialog-backdrop time-validation-alert-backdrop"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget)
+                setValidationAlertMessage("")
+            }}
+          >
+            <section
+              className="app-dialog"
+              role="alertdialog"
+              aria-modal="true"
+            >
+              <span className="dialog-icon neutral">
+                <Clock3 />
+              </span>
+              <h2>시간 설정 안내</h2>
+              <p>{validationAlertMessage}</p>
+              <Button
+                type="button"
+                onClick={() => setValidationAlertMessage("")}
+              >
+                확인
+              </Button>
+            </section>
+          </div>
+        )}
       </section>
     </div>
   )
 }
+
 
 type StoredMemberRecord = {
   id: string
@@ -1155,13 +2106,60 @@ function Auth({
       return
     }
     if (!signupId.trim() || !signupPassword.trim()) {
-      alert("아이디와 비밀번호를 입력해 주세요.")
+      await showAppAlert({
+        title: "입력 확인",
+        message: "아이디와 비밀번호를 입력해 주세요.",
+      })
       return
     }
-    if (role === "driver" && !driverLicenseSelected) {
-      setDriverLicenseError("운전면허증 파일(이미지 또는 PDF)을 업로드해 주세요.")
+    if (role === "driver") {
+      if (!driverLicenseSelected) {
+        setStep(4)
+        setDriverLicenseError("운전면허증 파일(이미지 또는 PDF)을 업로드해 주세요.")
+        await showAppAlert({
+          title: "면허증 확인",
+          message: "운전면허증 파일을 업로드해 주세요.",
+        })
+        return
+      }
+      const trimmedVehicle = vehicleName.trim()
+      if (!trimmedVehicle) {
+        setStep(4)
+        await showAppAlert({
+          title: "차종 입력 확인",
+          message: "차종을 입력해 주세요. (예: 아반떼, K5, 모닝 등)",
+        })
+        return
+      }
+      if (!/^[a-zA-Z0-9가-힣\s\-]+$/.test(trimmedVehicle)) {
+        setStep(4)
+        await showAppAlert({
+          title: "차종 형식 확인",
+          message: "차종은 한글, 영문, 숫자로 입력해 주세요. (예: 아반떼, K5, GV70)",
+        })
+        return
+      }
+      const capNum = Number(vehicleCapacity)
+      if (!Number.isInteger(capNum) || capNum <= 0) {
+        setStep(4)
+        await showAppAlert({
+          title: "차량 정원 확인",
+          message: "차량 정원을 1명 이상 숫자로 입력해 주세요.",
+        })
+        return
+      }
+    }
+    const cleanPhone = phone.trim()
+    if (!cleanPhone || !isValidPhoneNumber(cleanPhone)) {
+      setStep(2)
+      await showAppAlert({
+        title: "전화번호 확인",
+        message: "올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+      })
       return
     }
+    const normalizedPhone = normalizePhoneNumber(cleanPhone)
+
     setAuthLoading(true)
     const cleanSignupId = signupId.trim()
     const email =
@@ -1174,7 +2172,7 @@ function Auth({
       id: cleanSignupId,
       loginId: cleanSignupId,
       password: signupPassword,
-      phone,
+      phone: normalizedPhone,
       gender: "선택 안 함",
       isDriverVerified,
       licenseFileName: isDriverVerified ? driverLicenseFileName : undefined,
@@ -1187,7 +2185,7 @@ function Auth({
       email,
       password: signupPassword,
       name: profilePayload.name || "신규 회원",
-      phone,
+      phone: normalizedPhone,
       gender: "선택 안 함",
       role,
       isDriverVerified,
@@ -1208,7 +2206,7 @@ function Auth({
         try {
           await supabaseSignUp(email, signupPassword, {
             name: profilePayload.name || "신규 회원",
-            phone,
+            phone: normalizedPhone,
             gender: "선택 안 함",
             role,
             isDriverVerified,
@@ -1220,10 +2218,18 @@ function Auth({
           console.warn("Supabase 회원가입 폴백 처리:", supabaseErr)
         }
       }
-      alert("회원가입이 완료되었습니다!")
+      await showAppAlert({
+        title: "회원가입 완료",
+        message: "회원가입이 완료되었습니다!",
+        variant: "success",
+      })
       onLogin(role, profilePayload)
     } catch (err) {
-      alert(err instanceof Error ? err.message : "회원가입에 실패했습니다.")
+      await showAppAlert({
+        title: "회원가입 실패",
+        message: err instanceof Error ? err.message : "회원가입에 실패했습니다.",
+        variant: "danger",
+      })
     } finally {
       setAuthLoading(false)
     }
@@ -1368,13 +2374,17 @@ function Auth({
     }
   }
   const totalSignupSteps = role === "driver" ? 4 : 3
+  const isVehicleValid =
+    vehicleName.trim().length > 0 &&
+    /^[a-zA-Z0-9가-힣\s\-]+$/.test(vehicleName.trim())
+
   const driverInfoValid =
     driverLicenseSelected &&
-    vehicleName.trim().length > 1 &&
+    isVehicleValid &&
     Number.isInteger(Number(vehicleCapacity)) &&
     Number(vehicleCapacity) > 0
 
-  const handleNextSignupStep = () => {
+  const handleNextSignupStep = async () => {
     if (step === 1) {
       if (!verified) {
         setEmailError("학교 이메일 인증을 완료해야 다음 단계로 이동할 수 있습니다.")
@@ -1383,11 +2393,84 @@ function Auth({
       setStep(2)
       return
     }
+    if (step === 2) {
+      if (signupId.trim().length < 4) {
+        await showAppAlert({
+          title: "아이디 확인",
+          message: "아이디는 4자 이상 입력해 주세요.",
+        })
+        return
+      }
+      if (signupPassword.trim().length < 6) {
+        await showAppAlert({
+          title: "비밀번호 확인",
+          message: "비밀번호는 6자 이상 입력해 주세요.",
+        })
+        return
+      }
+      if (signupPassword !== passwordConfirm) {
+        await showAppAlert({
+          title: "비밀번호 불일치",
+          message: "비밀번호가 일치하지 않습니다.",
+        })
+        return
+      }
+      const cleanPhone = phone.trim()
+      if (!cleanPhone) {
+        await showAppAlert({
+          title: "전화번호 확인",
+          message: "전화번호를 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+        })
+        return
+      }
+      if (!isValidPhoneNumber(cleanPhone)) {
+        await showAppAlert({
+          title: "전화번호 형식 확인",
+          message: "올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+        })
+        return
+      }
+      setStep(3)
+      return
+    }
+    if (step === 4 && role === "driver") {
+      if (!driverLicenseSelected) {
+        setDriverLicenseError("운전면허증 파일(이미지 또는 PDF)을 업로드해 주세요.")
+        await showAppAlert({
+          title: "면허증 확인",
+          message: "운전면허증 파일을 업로드해 주세요.",
+        })
+        return
+      }
+      const trimmedVehicle = vehicleName.trim()
+      if (!trimmedVehicle) {
+        await showAppAlert({
+          title: "차종 입력 확인",
+          message: "차종을 입력해 주세요. (예: 아반떼, K5, 모닝 등)",
+        })
+        return
+      }
+      if (!/^[a-zA-Z0-9가-힣\s\-]+$/.test(trimmedVehicle)) {
+        await showAppAlert({
+          title: "차종 형식 확인",
+          message: "차종은 한글, 영문, 숫자로 입력해 주세요. (예: 아반떼, K5, GV70)",
+        })
+        return
+      }
+      const capNum = Number(vehicleCapacity)
+      if (!Number.isInteger(capNum) || capNum <= 0) {
+        await showAppAlert({
+          title: "차량 정원 확인",
+          message: "차량 정원을 1명 이상 숫자로 입력해 주세요.",
+        })
+        return
+      }
+    }
     if (step < totalSignupSteps) {
       setStep(step + 1)
       return
     }
-    void handleSignupComplete()
+    await handleSignupComplete()
   }
 
   if (view === "reset") {
@@ -1752,13 +2835,20 @@ function Auth({
                 />
                 <Button
                   variant="secondary"
-                  onClick={() => {
+                  onClick={async () => {
                     if (signupId.trim().length < 4) {
-                      alert("아이디는 4자 이상 입력해 주세요.")
+                      await showAppAlert({
+                        title: "아이디 확인",
+                        message: "아이디는 4자 이상 입력해 주세요.",
+                      })
                       return
                     }
                     setIdChecked(true)
-                    alert("사용 가능한 아이디입니다.")
+                    await showAppAlert({
+                      title: "아이디 확인",
+                      message: "사용 가능한 아이디입니다.",
+                      variant: "success",
+                    })
                   }}
                 >
                   <span className="duplicate-check-label" data-fge-id="fge-136">
@@ -1789,13 +2879,17 @@ function Auth({
               <Field
                 label="전화번호"
                 type="tel"
-                placeholder="010-0000-0000"
+                placeholder="예: 01012345678 ('-' 없이 숫자만 입력)"
+                maxLength={13}
                 value={phone}
-                onChange={(event) => setPhone(event.target.value)}
+                onChange={(event) => {
+                  const cleaned = event.target.value.replace(/[^0-9-]/g, "").slice(0, 13)
+                  setPhone(cleaned)
+                }}
               />
-              {phone && !/^010-\d{4}-\d{4}$/.test(phone) && (
+              {phone && !isValidPhoneNumber(phone) && (
                 <span className="field-error">
-                  010-0000-0000 형식으로 입력해 주세요.
+                  올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)
                 </span>
               )}
               <label className="field">
@@ -1875,8 +2969,8 @@ function Auth({
                 )}
               </div>
               <Field
-                label="차량 종류 및 차종 *"
-                placeholder="예: 현대 아반떼"
+                label="차종 *"
+                placeholder="예: 아반떼"
                 icon={<CarFront />}
                 value={vehicleName}
                 onChange={(event) => setVehicleName(event.target.value)}
@@ -1903,7 +2997,7 @@ function Auth({
             disabled={
               authLoading ||
               (step === 1 && !verified) ||
-              (step === 4 && !driverInfoValid)
+              (step === 4 && !driverLicenseSelected)
             }
             onClick={handleNextSignupStep}
           >
@@ -2114,6 +3208,66 @@ function RouteCard({
   small?: boolean
   route?: RouteData
 }) {
+  const syncExtracted = useMemo(
+    () =>
+      getExtractedWaypointsSync(
+        route?.start || "",
+        route?.destination || "",
+        route?.waypointsList ?? route?.waypoint,
+      ),
+    [route?.start, route?.destination, route?.waypoint, route?.waypointsList],
+  )
+  const [waypoints, setWaypoints] = useState<string[]>(
+    syncExtracted.waypointsList || [],
+  )
+  const [waypointLoading, setWaypointLoading] = useState(false)
+
+  useEffect(() => {
+    setWaypoints(syncExtracted.waypointsList || [])
+    const s = (route?.start || "").trim()
+    const d = (route?.destination || "").trim()
+    if (!s || !d) {
+      setWaypointLoading(false)
+      return
+    }
+    let cancelled = false
+    setWaypointLoading(true)
+    fetchRouteWaypointsFromMapBackend({
+      start: s,
+      destination: d,
+      fallbackWaypoints: route?.waypointsList ?? route?.waypoint,
+    })
+      .then((res) => {
+        if (cancelled) return
+        setWaypoints(Array.isArray(res?.waypointsList) ? res.waypointsList : [])
+      })
+      .catch(() => {
+        if (!cancelled) setWaypoints(syncExtracted.waypointsList || [])
+      })
+      .finally(() => {
+        if (!cancelled) setWaypointLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    route?.start,
+    route?.destination,
+    route?.waypoint,
+    route?.waypointsList,
+    syncExtracted.waypointsList,
+  ])
+
+  const hasValidEndpoints = Boolean(
+    route?.start?.trim() && route?.destination?.trim(),
+  )
+  const safeWaypoints = Array.isArray(waypoints) ? waypoints : []
+  const waypointSummary = waypointLoading
+    ? "실제 주행 경로 경유지 탐색 중..."
+    : safeWaypoints.length > 0
+      ? safeWaypoints.join(" · ")
+      : DIRECT_ROUTE_LABEL
+
   return (
     <div className={`route-card ${small ? "route-card--small" : ""}`}>
       <div className="route-line">
@@ -2123,15 +3277,20 @@ function RouteCard({
       </div>
       <div className="route-copy">
         <div>
-          <span>출발 · {route.departureTime || "08:30"}</span>
-          <strong>{route.start || "출발지 미설정"}</strong>
+          <span>출발 · {route?.departureTime || "08:30"}</span>
+          <strong>{route?.start || "출발지 미설정"}</strong>
         </div>
+        {hasValidEndpoints && (
+          <div className="route-card__waypoints">
+            <small>주요 경유지 · {waypointSummary}</small>
+          </div>
+        )}
         <div>
           <span>
             도착
-            {route.preferredArrival ? ` · ${route.preferredArrival}` : ""}
+            {route?.preferredArrival ? ` · ${route.preferredArrival}` : ""}
           </span>
-          <strong>{route.destination || "목적지 미설정"}</strong>
+          <strong>{route?.destination || "목적지 미설정"}</strong>
         </div>
       </div>
     </div>
@@ -2140,6 +3299,7 @@ function RouteCard({
 
 function RiderHome({
   open,
+  account,
   route,
   bookingDate,
   onOpenDatePicker,
@@ -2148,8 +3308,10 @@ function RiderHome({
   carpoolFlow,
   onOpenChat,
   onSelectRide,
+  onViewUserProfile,
 }: {
   open: (sheet: Sheet) => void
+  account?: AccountData
   route: RouteData
   bookingDate: string
   onOpenDatePicker: () => void
@@ -2158,6 +3320,7 @@ function RiderHome({
   carpoolFlow: DemoCarpoolState
   onOpenChat: (rideId: string) => void
   onSelectRide: (ride: MatchRide) => void
+  onViewUserProfile: (target: PublicUserProfileTarget) => void
 }) {
   const [activeRide, setActiveRide] = useState(0)
   const rideListRef = useRef<HTMLDivElement>(null)
@@ -2165,8 +3328,13 @@ function RiderHome({
     () => getVisibleMatchRides(route, carpoolFlow),
     [route, carpoolFlow],
   )
-  const riderApplications = carpoolFlow.applications.filter(
-    (item) => item.riderId === "demo-rider",
+  const myRiderId = (account?.id || account?.loginId || "").trim()
+  const riderApplications = carpoolFlow.applications.filter((item) =>
+    myRiderId
+      ? item.riderId === myRiderId ||
+        item.riderId === account?.id ||
+        item.riderId === account?.loginId
+      : item.riderId === "demo-rider",
   )
   const latestApplication = riderApplications[0]
   const latestApplicationRide = carpoolFlow.rides.find(
@@ -2183,12 +3351,14 @@ function RiderHome({
     setActiveRide(safeIndex)
   }
 
+  const driverDisplayName = latestApplicationRide?.driverName || "운전자"
+
   return (
     <div className="page">
       <section className="hello">
         <div>
           <p>좋은 아침이에요,</p>
-          <h1>민지님</h1>
+          <h1>{account?.name ? `${account.name}님` : "학우님"}</h1>
         </div>
         <div className="weather">
           <span>12°</span>
@@ -2339,7 +3509,33 @@ function RiderHome({
                   key={ride.id}
                   onClick={() => onSelectRide(ride)}
                 >
-                  <div className="ride-top">
+                  <div
+                    className="ride-top clickable-profile-trigger"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${ride.name} 운전자 프로필 상세 보기`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: ride.name,
+                        role: "driver",
+                        carInfo: ride.car,
+                        rating: ride.rating,
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: ride.name,
+                          role: "driver",
+                          carInfo: ride.car,
+                          rating: ride.rating,
+                        })
+                      }
+                    }}
+                  >
                     <div className="avatar">{ride.name.slice(0, 1)}</div>
                     <div>
                       <strong>
@@ -2356,7 +3552,13 @@ function RiderHome({
                         <small>{ride.time} 출발</small>
                       </span>
                     </div>
-                    <div className="via">경유 · {ride.via}</div>
+                    <div className="via">
+                      경유 ·{" "}
+                      {Array.isArray(ride?.waypointsList) &&
+                      ride.waypointsList.length > 0
+                        ? ride.waypointsList.join(" · ")
+                        : ride?.via || DIRECT_ROUTE_LABEL}
+                    </div>
                     <div>
                       <i />
                       <span>
@@ -2467,6 +3669,32 @@ function RiderHome({
                 {formatEtaTime(latestApplicationRide.estimatedArrival)} 도착 예정
                 · 약 {latestApplicationRide.estimatedDuration}분
               </small>
+              <span
+                className="clickable-profile-inline"
+                role="button"
+                tabIndex={0}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    name: driverDisplayName,
+                    role: "driver",
+                    carInfo: latestApplicationRide.vehicle,
+                  })
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      name: driverDisplayName,
+                      role: "driver",
+                      carInfo: latestApplicationRide.vehicle,
+                    })
+                  }
+                }}
+              >
+                <UserRound /> {driverDisplayName} 운전자 프로필 보기
+              </span>
             </div>
             <ChevronRight />
           </button>
@@ -2482,6 +3710,7 @@ function RiderHome({
   )
 }
 
+
 function DriverHome({
   open,
   route,
@@ -2496,6 +3725,7 @@ function DriverHome({
   carpoolFlow,
   onOpenChat,
   mileageBalance,
+  onViewUserProfile,
 }: {
   open: (sheet: Sheet) => void
   route: RouteData
@@ -2510,6 +3740,7 @@ function DriverHome({
   carpoolFlow: DemoCarpoolState
   onOpenChat: (rideId: string) => void
   mileageBalance: number
+  onViewUserProfile: (target: PublicUserProfileTarget) => void
 }) {
   const [showEndConfirm, setShowEndConfirm] = useState(false)
   const [approvalNoticeOpen, setApprovalNoticeOpen] = useState(false)
@@ -2613,8 +3844,57 @@ function DriverHome({
           )}
           {pendingApplication && (
             <article className="integrated-request">
-              <div className="avatar green">{pendingApplication.riderName.slice(0, 1)}</div>
-              <div>
+              <div
+                className="avatar green clickable-profile-trigger"
+                role="button"
+                tabIndex={0}
+                aria-label={`${pendingApplication.riderName} 탑승자 프로필 상세 보기`}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    id: pendingApplication.riderId,
+                    name: pendingApplication.riderName,
+                    role: "rider",
+                  })
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      id: pendingApplication.riderId,
+                      name: pendingApplication.riderName,
+                      role: "rider",
+                    })
+                  }
+                }}
+              >
+                {pendingApplication.riderName.slice(0, 1)}
+              </div>
+              <div
+                className="clickable-profile-trigger"
+                role="button"
+                tabIndex={0}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    id: pendingApplication.riderId,
+                    name: pendingApplication.riderName,
+                    role: "rider",
+                  })
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      id: pendingApplication.riderId,
+                      name: pendingApplication.riderName,
+                      role: "rider",
+                    })
+                  }
+                }}
+              >
                 <strong>{pendingApplication.riderName} 탑승 신청</strong>
                 <small>
                   {new Date(pendingApplication.createdAt).toLocaleString(
@@ -2749,7 +4029,30 @@ function DriverHome({
           tripFlow.status === "결제 완료") && (
           <div className="driver-payment-status">
             <div>
-              <span>박민지 탑승자</span>
+              <span
+                className="clickable-profile-inline"
+                role="button"
+                tabIndex={0}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    name: tripFlow.passengerName || "탑승자",
+                    role: "rider",
+                  })
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      name: tripFlow.passengerName || "탑승자",
+                      role: "rider",
+                    })
+                  }
+                }}
+              >
+                {tripFlow.passengerName || "탑승자"} 탑승자
+              </span>
               <strong>
                 {tripFlow.status === "결제 완료" ? "결제 완료" : "결제 대기"}
               </strong>
@@ -2842,8 +4145,57 @@ function DriverHome({
             .filter((item) => item.status === "승인 대기")
             .map((app) => (
               <div className="request-card" key={app.id}>
-                <div className="avatar green">{app.riderName.slice(0, 1) || "탑"}</div>
-                <div>
+                <div
+                  className="avatar green clickable-profile-trigger"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`${app.riderName} 탑승자 프로필 상세 보기`}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      id: app.riderId,
+                      name: app.riderName,
+                      role: "rider",
+                    })
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        id: app.riderId,
+                        name: app.riderName,
+                        role: "rider",
+                      })
+                    }
+                  }}
+                >
+                  {app.riderName.slice(0, 1) || "탑"}
+                </div>
+                <div
+                  className="clickable-profile-trigger"
+                  role="button"
+                  tabIndex={0}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      id: app.riderId,
+                      name: app.riderName,
+                      role: "rider",
+                    })
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        id: app.riderId,
+                        name: app.riderName,
+                        role: "rider",
+                      })
+                    }
+                  }}
+                >
                   <strong>{app.riderName}</strong>
                   <span>탑승 신청 대기 중</span>
                   <small>
@@ -2909,14 +4261,17 @@ function DriverHome({
   )
 }
 
+
 function SchedulePage({
   role,
   open,
   carpoolFlow,
+  onViewUserProfile,
 }: {
   role: Role
   open: (sheet: Sheet) => void
   carpoolFlow: DemoCarpoolState
+  onViewUserProfile: (target: PublicUserProfileTarget) => void
 }) {
   const today = new Date()
   const initialWeekStart = new Date(today)
@@ -3080,7 +4435,30 @@ function SchedulePage({
                     <h3>
                       {ride.start} → {ride.destination}
                     </h3>
-                    <p>
+                    <p
+                      className="clickable-profile-inline"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: ride.driverName,
+                          role: "driver",
+                          carInfo: ride.vehicle,
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            name: ride.driverName,
+                            role: "driver",
+                            carInfo: ride.vehicle,
+                          })
+                        }
+                      }}
+                    >
                       <CarFront /> {ride.driverName} · {ride.vehicle}
                     </p>
                     <p>
@@ -3141,100 +4519,260 @@ function SchedulePage({
   )
 }
 
-function filterChatRooms(rooms: ChatRoomData[], query: string): ChatRoomData[] {
+function filterRealtimeChatRooms(
+  rooms: RealtimeChatRoom[],
+  query: string,
+  currentUserId?: string,
+  currentLoginId?: string,
+): RealtimeChatRoom[] {
   const normalizedQuery = query.trim().toLocaleLowerCase("ko-KR")
   if (!normalizedQuery) return rooms
 
-  return rooms.filter((room) =>
-    [room.title, room.meeting, room.members]
+  return rooms.filter((room) => {
+    const counterpart = getCounterpartProfile(
+      room,
+      currentUserId,
+      currentLoginId,
+    )
+    return [
+      room?.title || "",
+      room?.meeting || "",
+      counterpart?.name || "",
+      room?.lastMessage || "",
+    ]
       .join(" ")
       .toLocaleLowerCase("ko-KR")
-      .includes(normalizedQuery),
-  )
+      .includes(normalizedQuery)
+  })
 }
 
 function ChatPage({
+  account,
+  role,
+  loggedIn,
+  onRequireLogin,
   carpoolFlow,
   initialRideId,
   onInitialRideConsumed,
+  onViewUserProfile,
 }: {
+  account: AccountData
+  role: Role
+  loggedIn: boolean
+  onRequireLogin: () => void
   carpoolFlow: DemoCarpoolState
   initialRideId: string | null
   onInitialRideConsumed: () => void
+  onViewUserProfile: (target: PublicUserProfileTarget) => void
 }) {
+  const realtimeChatState = useSyncExternalStore(
+    subscribeRealtimeChat,
+    getRealtimeChatSnapshot,
+    getRealtimeChatSnapshot,
+  )
+  const currentUserId = (account?.id || account?.loginId || "").trim()
+  const currentLoginId = (account?.loginId || account?.id || "").trim()
+  const currentUserName = normalizeDisplayName(account?.name)
+
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
   const [draft, setDraft] = useState("")
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
+  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false)
   const searchInputRef = useRef<HTMLInputElement>(null)
-  const [messagesByChat, setMessagesByChat] =
-    useState<Record<string, string[]>>(() =>
-      Object.fromEntries(
-        demoChatRooms.map((room) => [
-          room.id,
-          readDemoList<string>(`chat-${room.id}`),
-        ]),
-      ),
-    )
-  const flowChatRooms: ChatRoomData[] = carpoolFlow.rides
-    .filter((ride) =>
-      carpoolFlow.applications.some(
-        (item) => item.rideId === ride.id && item.status === "승인 완료",
-      ),
-    )
-    .map((ride) => ({
-      id: `chat-${ride.id}`,
-      rideId: ride.id,
-      title: `${ride.start} → ${ride.destination}`,
-      members: `${ride.driverName} · 박민지`,
-      preview:
-        ride.status === "정산 대기"
-          ? "운행이 종료되었습니다. 정산을 진행해 주세요."
-          : "승인된 카풀의 데모 채팅방입니다.",
-      time: ride.date,
-      meeting: `${ride.date} ${ride.time} · ${ride.start}`,
-    }))
-  const allChatRooms = [...flowChatRooms, ...demoChatRooms]
-  const selectedChat = allChatRooms.find((room) => room.id === selectedChatId)
-  const selectedFlowRide = carpoolFlow.rides.find(
-    (ride) => ride.id === selectedChat?.rideId,
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // 승인된 카풀 중 현재 로그인 계정이 실제 참여자인 건이 있으면 실시간 채팅방 목록에 동기화
+  useEffect(() => {
+    if (!loggedIn || !currentUserId) return
+    const ridesList = Array.isArray(carpoolFlow?.rides) ? carpoolFlow.rides : []
+    const appsList = Array.isArray(carpoolFlow?.applications)
+      ? carpoolFlow.applications
+      : []
+
+    for (const app of appsList) {
+      if (app?.status !== "승인 완료") continue
+      const ride = ridesList.find((r) => r?.id === app.rideId)
+      if (!ride) continue
+
+      const isMyApplication =
+        app.riderId === currentUserId ||
+        app.riderId === currentLoginId ||
+        (account?.name && app.riderName === account.name)
+      const isMyDrivenRide =
+        ride.driverId === currentUserId ||
+        ride.driverId === currentLoginId ||
+        (account?.name && ride.driverName === account.name)
+
+      if (!isMyApplication && !isMyDrivenRide) continue
+
+      getOrCreateCarpoolChatRoom({
+        currentUser: {
+          id: currentUserId,
+          loginId: currentLoginId,
+          name: currentUserName,
+          role,
+          carInfo: account?.vehicleName,
+          isDriverVerified: account?.isDriverVerified,
+        },
+        targetUser: isMyApplication
+          ? {
+              id: ride.driverId || `account-${ride.driverName}`,
+              name: ride.driverName || "알 수 없는 사용자",
+              role: "driver",
+              carInfo: ride.vehicle,
+              licenseVerified: true,
+            }
+          : {
+              id: app.riderId || `account-${app.riderName}`,
+              name: app.riderName || "알 수 없는 사용자",
+              role: "rider",
+            },
+        ride: {
+          id: ride.id,
+          start: ride.start,
+          destination: ride.destination,
+          date: ride.date,
+          time: ride.time,
+          waypoints: ride.waypoints,
+        },
+      })
+    }
+  }, [
+    loggedIn,
+    currentUserId,
+    currentLoginId,
+    currentUserName,
+    role,
+    account?.name,
+    account?.vehicleName,
+    account?.isDriverVerified,
+    carpoolFlow?.rides,
+    carpoolFlow?.applications,
+  ])
+
+  const myChatRooms = useMemo(
+    () => getRoomsForUser(currentUserId, currentLoginId),
+    [currentUserId, currentLoginId, realtimeChatState],
   )
-  const filteredChatRooms = filterChatRooms(allChatRooms, searchQuery)
+
+  const selectedChat = useMemo(
+    () =>
+      myChatRooms.find(
+        (room) =>
+          room?.id === selectedChatId ||
+          (selectedChatId && room?.rideId === selectedChatId),
+      ) || null,
+    [myChatRooms, selectedChatId],
+  )
+
+  const selectedFlowRide = useMemo(
+    () =>
+      (carpoolFlow?.rides || []).find(
+        (ride) => ride?.id === selectedChat?.rideId,
+      ),
+    [carpoolFlow?.rides, selectedChat?.rideId],
+  )
+
+  const roomMessages = useMemo(
+    () => getMessagesForRoom(selectedChat?.id),
+    [selectedChat?.id, realtimeChatState],
+  )
+
+  const filteredChatRooms = useMemo(
+    () =>
+      filterRealtimeChatRooms(
+        myChatRooms,
+        searchQuery,
+        currentUserId,
+        currentLoginId,
+      ),
+    [myChatRooms, searchQuery, currentUserId, currentLoginId],
+  )
   const hasSearchQuery = searchQuery.trim().length > 0
+
   useEffect(() => {
     if (isSearchOpen) searchInputRef.current?.focus()
   }, [isSearchOpen])
+
   useEffect(() => {
     if (!initialRideId) return
-    setSelectedChatId(`chat-${initialRideId}`)
+    const matchedRoom = myChatRooms.find(
+      (r) => r.id === initialRideId || r.rideId === initialRideId,
+    )
+    setSelectedChatId(matchedRoom ? matchedRoom.id : initialRideId)
     onInitialRideConsumed()
-  }, [initialRideId, onInitialRideConsumed])
+  }, [initialRideId, myChatRooms, onInitialRideConsumed])
+
+  // 새 메시지 수신/전송 시 스크롤 자동 하단 이동
+  useEffect(() => {
+    if (!selectedChat) return
+    const timer = window.setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "end",
+      })
+    }, 40)
+    return () => window.clearTimeout(timer)
+  }, [selectedChat?.id, roomMessages.length])
+
   const [settlementConfirmOpen, setSettlementConfirmOpen] = useState(false)
   const [noticeOpen, setNoticeOpen] = useState(false)
   const [noticeLiked, setNoticeLiked] = useState(false)
   const [noticeComment, setNoticeComment] = useState("")
   const [noticeComments, setNoticeComments] = useState<string[]>([])
+
+  // 비로그인 접근 방어
+  if (!loggedIn || !currentUserId) {
+    return (
+      <div className="page page--plain">
+        <div className="page-title">
+          <div>
+            <span className="eyebrow">MESSAGES</span>
+            <h1>채팅</h1>
+          </div>
+        </div>
+        <div className="chat-search-empty">
+          <MessageCircle />
+          <strong>로그인이 필요한 서비스입니다.</strong>
+          <p>실시간 카풀 채팅을 이용하려면 로그인 화면에서 로그인해 주세요.</p>
+          <Button type="button" onClick={onRequireLogin}>
+            로그인 화면으로 이동
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  const counterpartProfile = getCounterpartProfile(
+    selectedChat,
+    currentUserId,
+    currentLoginId,
+  )
+  const counterpartName = normalizeDisplayName(counterpartProfile?.name)
+  const counterpartInitial = counterpartName.slice(0, 1) || "?"
+
   const noticeAuthor =
-    selectedFlowRide?.driverName ??
-    selectedChat?.members.split(" · ")[0].split(" ")[0] ??
-    "운전자"
+    selectedFlowRide?.driverName || counterpartName || "알 수 없는 사용자"
   const [noticeDeparture, noticeLocation] = (
     selectedChat?.meeting ?? ""
   ).split(" · ")
   const noticeDestination =
     selectedFlowRide?.destination ??
-    selectedChat?.title.split(" → ").at(-1) ??
+    selectedChat?.destination ??
+    selectedChat?.title?.split(" → ")?.at(-1) ??
     "목적지"
   const noticeSummary = selectedChat
-    ? `${noticeDeparture} · ${noticeLocation} 출발 안내`
+    ? `${noticeDeparture || "오늘"} · ${noticeLocation || "출발지"} 출발 안내`
     : "카풀 출발 안내"
   const noticeBody = selectedChat
-    ? `${noticeDeparture}에 ${noticeLocation}에서 출발합니다.\n\n최종 목적지는 ${noticeDestination}입니다.${
+    ? `${noticeDeparture || "예정 시간"}에 ${noticeLocation || "출발 장소"}에서 출발합니다.\n\n최종 목적지는 ${noticeDestination}입니다.${
         selectedFlowRide
           ? ` 등록 일정 기준 도착 예정 시간은 ${formatEtaTime(selectedFlowRide.estimatedArrival)}이며, 예상 소요 시간은 약 ${selectedFlowRide.estimatedDuration}분입니다.`
           : ""
       }\n\n탑승자는 약속 시간 5분 전까지 출발 장소에 도착해 주세요. 출발 시간이나 장소가 변경되면 이 채팅방의 일정 정보와 공지에 함께 반영됩니다.`
     : "채팅방에 저장된 출발 시간과 장소를 확인해 주세요."
+
   const quickMessages = [
     "📍 지금 정류장 근처예요",
     "🚗 탑승 완료",
@@ -3242,18 +4780,18 @@ function ChatPage({
     "📍 도착했어요",
     "확인했습니다",
   ]
+
   const sendMessage = () => {
     if (!draft.trim() || !selectedChat) return
-    setMessagesByChat((current) => {
-      const updatedMessages = [
-        ...(current[selectedChat.id] || []),
-        draft.trim(),
-      ]
-      writeDemoData(`chat-${selectedChat.id}`, updatedMessages)
-      return { ...current, [selectedChat.id]: updatedMessages }
+    sendRealtimeChatMessage({
+      roomId: selectedChat.id,
+      senderId: currentUserId,
+      senderName: currentUserName,
+      text: draft.trim(),
     })
     setDraft("")
   }
+
   if (selectedChat)
     return (
       <div className="chat-room">
@@ -3261,17 +4799,56 @@ function ChatPage({
           <button
             className="icon-button"
             onClick={() => setSelectedChatId(null)}
+            aria-label="채팅방 목록으로 돌아가기"
           >
             <ArrowLeft />
           </button>
-          <div>
-            <strong>{selectedChat.title}</strong>
-            <span>
-              <i /> 운행 예정 · 3명
-            </span>
+          <div
+            className="chat-header__counterpart clickable-profile-trigger"
+            role="button"
+            tabIndex={0}
+            aria-label={`${counterpartName} 프로필 상세 보기`}
+            onClick={(event) => {
+              event.stopPropagation()
+              onViewUserProfile({
+                id: counterpartProfile.id,
+                name: counterpartName,
+                role: counterpartProfile.role,
+                carInfo:
+                  selectedFlowRide?.vehicle || counterpartProfile.carInfo,
+              })
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault()
+                event.stopPropagation()
+                onViewUserProfile({
+                  id: counterpartProfile.id,
+                  name: counterpartName,
+                  role: counterpartProfile.role,
+                  carInfo:
+                    selectedFlowRide?.vehicle || counterpartProfile.carInfo,
+                })
+              }
+            }}
+          >
+            <div className="avatar small">{counterpartInitial}</div>
+            <div>
+              <strong>{selectedChat?.title || "카풀 채팅방"}</strong>
+              <span>
+                <i /> {counterpartName}{" "}
+                {counterpartProfile.role === "driver" ? "운전자" : "탑승자"} ·
+                프로필 보기
+              </span>
+            </div>
           </div>
-          <button className="icon-button">
-            <CircleHelp />
+          <button
+            className="icon-button"
+            onClick={() => setLeaveConfirmOpen(true)}
+            aria-label="채팅방 나가기"
+            title="채팅방 나가기"
+          >
+            <X />
           </button>
         </div>
         <button
@@ -3307,7 +4884,8 @@ function ChatPage({
               </span>
             </div>
             <p>
-              예상 소요 시간 약 {selectedFlowRide.estimatedDuration}분 ·{" "}
+              주요 경유지 · {selectedFlowRide.waypoints || DIRECT_ROUTE_LABEL} ·
+              약 {selectedFlowRide.estimatedDuration}분 ·{" "}
               {selectedFlowRide.status}
             </p>
           </section>
@@ -3327,30 +4905,87 @@ function ChatPage({
         )}
         {selectedFlowRide?.status === "완료" && (
           <section className="chat-settlement-card complete">
-            <span className="tag open">데모 정산 완료</span>
-            <strong>이 카풀의 데모 정산이 완료되었습니다.</strong>
+            <span className="tag open">정산 완료</span>
+            <strong>이 카풀의 정산이 완료되었습니다.</strong>
           </section>
         )}
         <div className="messages">
-          <span className="date-divider">오늘</span>
-          <div className="bubble other">
-            <span className="chat-name">
-              {selectedChat.members.split(" ")[0]}{" "}
-              <ShieldCheck aria-label="인증 사용자" />
-            </span>
-            <p>{selectedChat.preview}</p>
-            <time>오후 7:24</time>
-          </div>
-          <div className="bubble mine">
-            <p>네, 확인했습니다. 감사합니다!</p>
-            <time>오후 7:26</time>
-          </div>
-          {(messagesByChat[selectedChat.id] || []).map((message, index) => (
-            <div className="bubble mine" key={`${message}-${index}`}>
-              <p>{message}</p>
-              <time>지금</time>
+          {Array.isArray(roomMessages) && roomMessages.length > 0 ? (
+            <>
+              <span className="date-divider">실시간 대화</span>
+              {roomMessages.map((msg) => {
+                const isMine =
+                  msg?.senderId === currentUserId ||
+                  (Boolean(currentLoginId) && msg?.senderId === currentLoginId)
+                const senderLabel = normalizeDisplayName(
+                  msg?.senderName || counterpartName,
+                )
+                const senderInitial = senderLabel.slice(0, 1) || "?"
+
+                if (isMine) {
+                  return (
+                    <div className="bubble mine" key={msg.id}>
+                      <p>{msg?.text || ""}</p>
+                      <time>{formatChatTimestamp(msg?.createdAt)}</time>
+                    </div>
+                  )
+                }
+
+                return (
+                  <div className="bubble other" key={msg.id}>
+                    <div
+                      className="chat-sender-row clickable-profile-trigger"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${senderLabel} 프로필 상세 보기`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: msg?.senderId || counterpartProfile.id,
+                          name: senderLabel,
+                          role: counterpartProfile.role,
+                          carInfo:
+                            selectedFlowRide?.vehicle ||
+                            counterpartProfile.carInfo,
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            id: msg?.senderId || counterpartProfile.id,
+                            name: senderLabel,
+                            role: counterpartProfile.role,
+                            carInfo:
+                              selectedFlowRide?.vehicle ||
+                              counterpartProfile.carInfo,
+                          })
+                        }
+                      }}
+                    >
+                      <div className="avatar small">{senderInitial}</div>
+                      <span className="chat-name">
+                        {senderLabel} <ShieldCheck aria-label="인증 사용자" />
+                      </span>
+                    </div>
+                    <p>{msg?.text || ""}</p>
+                    <time>{formatChatTimestamp(msg?.createdAt)}</time>
+                  </div>
+                )
+              })}
+            </>
+          ) : (
+            <div className="chat-room-empty-messages">
+              <MessageCircle />
+              <strong>아직 주고받은 메시지가 없습니다.</strong>
+              <p>
+                {counterpartName}님에게 탑승 위치나 출발 시간을 먼저 문의해
+                보세요.
+              </p>
             </div>
-          ))}
+          )}
+          <div ref={messagesEndRef} />
         </div>
         <div className="quick-messages">
           {quickMessages.map((message) => (
@@ -3360,7 +4995,7 @@ function ChatPage({
           ))}
         </div>
         <div className="chat-input">
-          <button>
+          <button type="button" aria-label="추가 기능">
             <Plus />
           </button>
           <input
@@ -3373,6 +5008,45 @@ function ChatPage({
             <Send />
           </button>
         </div>
+        {leaveConfirmOpen && (
+          <div
+            className="dialog-backdrop flow-dialog-backdrop"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget)
+                setLeaveConfirmOpen(false)
+            }}
+          >
+            <section className="app-dialog" role="alertdialog" aria-modal="true">
+              <span className="dialog-icon neutral">
+                <MessageCircle />
+              </span>
+              <h2>채팅방을 나가시겠습니까?</h2>
+              <p>채팅방을 나가면 내 채팅방 목록에서 제거됩니다.</p>
+              <div className="dialog-actions">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setLeaveConfirmOpen(false)}
+                >
+                  취소
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    leaveRealtimeChatRoom(selectedChat.id, currentUserId)
+                    if (currentLoginId && currentLoginId !== currentUserId) {
+                      leaveRealtimeChatRoom(selectedChat.id, currentLoginId)
+                    }
+                    setLeaveConfirmOpen(false)
+                    setSelectedChatId(null)
+                  }}
+                >
+                  나가기
+                </Button>
+              </div>
+            </section>
+          </div>
+        )}
         {noticeOpen && (
           <div
             className="notice-detail-backdrop"
@@ -3405,11 +5079,36 @@ function ChatPage({
                 </div>
               </header>
               <div className="notice-detail-scroll">
-                <section className="notice-author">
-                  <div className="avatar">{noticeAuthor.slice(0, 1)}</div>
+                <section
+                  className="notice-author clickable-profile-trigger"
+                  role="button"
+                  tabIndex={0}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onViewUserProfile({
+                      name: noticeAuthor,
+                      role: "driver",
+                      carInfo: selectedFlowRide?.vehicle,
+                    })
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: noticeAuthor,
+                        role: "driver",
+                        carInfo: selectedFlowRide?.vehicle,
+                      })
+                    }
+                  }}
+                >
+                  <div className="avatar">
+                    {(noticeAuthor || "운").slice(0, 1)}
+                  </div>
                   <div>
                     <strong>{noticeAuthor}</strong>
-                    <span>2시간 전 · 공지</span>
+                    <span>공지</span>
                   </div>
                 </section>
                 <article className="notice-body">
@@ -3435,9 +5134,59 @@ function ChatPage({
                     <strong>댓글 {noticeComments.length}</strong>
                     {noticeComments.map((comment, index) => (
                       <article key={`${comment}-${index}`}>
-                        <div className="avatar green">민</div>
+                        <div
+                          className="avatar green clickable-profile-trigger"
+                          role="button"
+                          tabIndex={0}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            onViewUserProfile({
+                              id: currentUserId,
+                              name: currentUserName,
+                              role,
+                            })
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              onViewUserProfile({
+                                id: currentUserId,
+                                name: currentUserName,
+                                role,
+                              })
+                            }
+                          }}
+                        >
+                          {currentUserName.slice(0, 1) || "나"}
+                        </div>
                         <div>
-                          <strong>박민지</strong>
+                          <strong
+                            className="clickable-profile-inline"
+                            role="button"
+                            tabIndex={0}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              onViewUserProfile({
+                                id: currentUserId,
+                                name: currentUserName,
+                                role,
+                              })
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault()
+                                event.stopPropagation()
+                                onViewUserProfile({
+                                  id: currentUserId,
+                                  name: currentUserName,
+                                  role,
+                                })
+                              }
+                            }}
+                          >
+                            {currentUserName}
+                          </strong>
                           <p>{comment}</p>
                           <span>방금 전</span>
                         </div>
@@ -3509,6 +5258,7 @@ function ChatPage({
         )}
       </div>
     )
+
   return (
     <div className="page page--plain">
       <div className={`page-title ${isSearchOpen ? "chat-search-header" : ""}`}>
@@ -3563,31 +5313,99 @@ function ChatPage({
           </>
         )}
       </div>
-      {filteredChatRooms.length > 0 ? (
+      {Array.isArray(filteredChatRooms) && filteredChatRooms.length > 0 ? (
         <>
           <div className="chat-list">
-            {filteredChatRooms.map((room) => {
-              const originalIndex = allChatRooms.findIndex(
-                (item) => item.id === room.id,
+            {filteredChatRooms.map((room, index) => {
+              const roomCounterpart = getCounterpartProfile(
+                room,
+                currentUserId,
+                currentLoginId,
               )
+              const primaryMemberName = normalizeDisplayName(
+                roomCounterpart?.name,
+              )
+              const avatarInitial = primaryMemberName.slice(0, 1) || "?"
+              const roomMsgs = getMessagesForRoom(room?.id)
+              const lastMsgObj = roomMsgs.at(-1)
+              const previewText =
+                lastMsgObj?.text ||
+                room?.lastMessage ||
+                "카풀 채팅방이 생성되었습니다. 대화를 시작해 보세요."
+              const previewTime = formatChatRoomListTime(
+                lastMsgObj?.createdAt || room?.lastMessageAt || room?.createdAt,
+              )
+
               return (
                 <button
                   onClick={() => setSelectedChatId(room.id)}
                   key={room.id}
                 >
-                  <div className={`avatar ${originalIndex > 0 ? "green" : ""}`}>
-                    {room.members.slice(0, 1)}
+                  <div
+                    className={`avatar clickable-profile-trigger ${
+                      index > 0 ? "green" : ""
+                    }`}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${primaryMemberName} 프로필 상세 보기`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        id: roomCounterpart.id,
+                        name: primaryMemberName,
+                        role: roomCounterpart.role,
+                        carInfo: roomCounterpart.carInfo,
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: roomCounterpart.id,
+                          name: primaryMemberName,
+                          role: roomCounterpart.role,
+                          carInfo: roomCounterpart.carInfo,
+                        })
+                      }
+                    }}
+                  >
+                    {avatarInitial}
                   </div>
                   <div>
-                    <strong>{room.title}</strong>
-                    <span>{room.members}</span>
-                    <p>
-                      {(messagesByChat[room.id] || []).at(-1) || room.preview}
-                    </p>
+                    <strong>{room?.title || "카풀 채팅방"}</strong>
+                    <span
+                      className="clickable-profile-inline"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: roomCounterpart.id,
+                          name: primaryMemberName,
+                          role: roomCounterpart.role,
+                          carInfo: roomCounterpart.carInfo,
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            id: roomCounterpart.id,
+                            name: primaryMemberName,
+                            role: roomCounterpart.role,
+                            carInfo: roomCounterpart.carInfo,
+                          })
+                        }
+                      }}
+                    >
+                      {primaryMemberName} · {currentUserName}
+                    </span>
+                    <p>{previewText}</p>
                   </div>
                   <div>
-                    <time>{room.time}</time>
-                    {originalIndex === 0 && <i>2</i>}
+                    <time>{previewTime}</time>
                   </div>
                 </button>
               )
@@ -3598,7 +5416,7 @@ function ChatPage({
             <span>
               {hasSearchQuery
                 ? `${filteredChatRooms.length}개의 채팅방을 찾았어요.`
-                : "승인된 카풀의 채팅방만 열려요."}
+                : "내가 참여 중인 카풀 채팅방이 실시간으로 동기화됩니다."}
             </span>
           </div>
         </>
@@ -3613,7 +5431,7 @@ function ChatPage({
           <p>
             {hasSearchQuery
               ? "다른 이름이나 경로로 검색해 보세요."
-              : "카풀 탑승 신청이 승인되면 채팅방이 생성됩니다."}
+              : "카풀 게시글에서 채팅하기를 누르거나 탑승 신청을 진행하면 채팅방이 생성됩니다."}
           </p>
         </div>
       )}
@@ -3653,10 +5471,12 @@ function ProfilePage({
     text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
     tags: review.keywords,
   }))
+  const userReceivedReviews = readDemoList<DemoReview>(`received-reviews-${account.id || account.loginId || "user"}`)
+  const legacyReceivedReviews = readDemoList<DemoReview>("received-reviews")
   const profileReviews = [
     ...flowReviews,
-    ...readDemoList<DemoReview>("received-reviews"),
-    ...demoReceivedReviews,
+    ...userReceivedReviews,
+    ...legacyReceivedReviews,
   ]
   const reviewCount = profileReviews.length
   const averageRating =
@@ -3665,7 +5485,21 @@ function ProfilePage({
           profileReviews.reduce((sum, item) => sum + item.score, 0) /
           reviewCount
         ).toFixed(1)
-      : "5.0"
+      : "0.0"
+
+  const myDriverCompletedCount = carpoolFlow.rides.filter(
+    (ride) =>
+      (ride.driverId === account.id ||
+        ride.driverId === account.loginId ||
+        ride.driverName === account.name) &&
+      ride.status === "완료",
+  ).length
+
+  const myRiderCompletedCount = carpoolFlow.applications.filter(
+    (app) =>
+      (app.riderId === account.id || app.riderId === account.loginId) &&
+      app.status === "완료",
+  ).length
   const activeBadgeIds = useMemo(() => {
     const baseIds = selectedBadges[role] ? [...selectedBadges[role]] : []
     if (account.isDriverVerified && !baseIds.includes("driver-license")) {
@@ -3734,14 +5568,8 @@ function ProfilePage({
         <div>
           <strong>
             {role === "driver"
-              ? `${
-                  new Set(
-                    carpoolFlow.rides
-                      .filter((ride) => ride.status === "완료")
-                      .map((ride) => ride.id),
-                  ).size || 8
-                }회`
-              : "12회"}
+              ? `${myDriverCompletedCount}회`
+              : `${myRiderCompletedCount}회`}
           </strong>
           <span>{role === "driver" ? "운전 횟수" : "탑승 횟수"}</span>
         </div>
@@ -3837,7 +5665,20 @@ function ProfilePage({
           <span>설정</span>
           <ChevronRight />
         </button>
-        <button onClick={logout}>
+        <button
+          onClick={async () => {
+            const ok = await showAppConfirm({
+              title: "로그아웃",
+              message: "현재 계정에서 로그아웃할까요?",
+              confirmText: "로그아웃",
+              cancelText: "취소",
+              variant: "danger",
+            })
+            if (ok) {
+              logout()
+            }
+          }}
+        >
           <ArrowLeft />
           <span>로그아웃</span>
           <ChevronRight />
@@ -4147,6 +5988,8 @@ function SheetView({
   mileageBalance,
   carpoolFlow,
   selectedRide,
+  onViewUserProfile,
+  onStartCarpoolChat,
 }: {
   type: Exclude<Sheet, null>
   close: () => void
@@ -4168,6 +6011,11 @@ function SheetView({
   mileageBalance: number
   carpoolFlow: DemoCarpoolState
   selectedRide: MatchRide | null
+  onViewUserProfile: (target: PublicUserProfileTarget) => void
+  onStartCarpoolChat: (
+    targetUser: CreateOrJoinChatParams["targetUser"],
+    rideInfo: CreateOrJoinChatParams["ride"],
+  ) => void
 }) {
   const sheetRef = useRef<HTMLElement>(null)
   const mileageBarcodeRef = useRef<SVGSVGElement>(null)
@@ -4302,6 +6150,8 @@ function SheetView({
   const [routeDeparturePickerOpen, setRouteDeparturePickerOpen] =
     useState(false)
   const [routeArrivalPickerOpen, setRouteArrivalPickerOpen] = useState(false)
+  const [routeTimeAlert, setRouteTimeAlert] = useState("")
+  const [routeTimeAutoNotice, setRouteTimeAutoNotice] = useState("")
   const [createError, setCreateError] = useState("")
   useEffect(() => {
     setRouteDraft(route)
@@ -4526,17 +6376,21 @@ function SheetView({
       carpoolFlow.reviews.length
     })`,
   }
-  const requestClose = () => {
-    if (
-      type === "route-edit" &&
-      routeDirty &&
-      !window.confirm("저장하지 않은 변경 사항을 폐기할까요?")
-    )
-      return
+  const requestClose = async () => {
+    if (type === "route-edit" && routeDirty) {
+      const ok = await showAppConfirm({
+        title: "변경 사항 폐기",
+        message: "저장하지 않은 변경 사항을 폐기할까요?",
+        confirmText: "폐기하기",
+        cancelText: "계속 편집",
+        variant: "danger",
+      })
+      if (!ok) return
+    }
     close()
   }
   const flowSheetReviews: DemoReview[] = carpoolFlow.reviews.map((review) => ({
-    author: "박민지 탑승자 · 데모 리뷰",
+    author: review.riderName || "탑승자 리뷰",
     date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
     score: review.rating,
     text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
@@ -4563,6 +6417,135 @@ function SheetView({
   ).toFixed(1)
   const sheetMatches = getVisibleMatchRides(route, carpoolFlow)
   const detailRide = selectedRide ?? sheetMatches[0]
+
+  const [detailWaypoints, setDetailWaypoints] = useState<string[]>(
+    () => detailRide?.waypointsList || [],
+  )
+  const [detailWaypointsLoading, setDetailWaypointsLoading] = useState(false)
+  const [createWaypointsList, setCreateWaypointsList] = useState<string[]>([])
+  const [createWaypointsLoading, setCreateWaypointsLoading] = useState(false)
+  const [routeWaypointsList, setRouteWaypointsList] = useState<string[]>(
+    () => route?.waypointsList || [],
+  )
+  const [routeWaypointsLoading, setRouteWaypointsLoading] = useState(false)
+
+  useEffect(() => {
+    if (type !== "ride" || !detailRide) return
+    const syncRes = getExtractedWaypointsSync(
+      detailRide.start,
+      detailRide.end,
+      detailRide.waypointsList ?? detailRide.via,
+    )
+    setDetailWaypoints(syncRes.waypointsList || [])
+    let cancelled = false
+    setDetailWaypointsLoading(true)
+    fetchRouteWaypointsFromMapBackend({
+      start: detailRide.start,
+      destination: detailRide.end,
+      fallbackWaypoints: detailRide.waypointsList ?? detailRide.via,
+    })
+      .then((res) => {
+        if (cancelled) return
+        setDetailWaypoints(
+          Array.isArray(res?.waypointsList) ? res.waypointsList : [],
+        )
+      })
+      .catch(() => {
+        if (!cancelled) setDetailWaypoints(syncRes.waypointsList || [])
+      })
+      .finally(() => {
+        if (!cancelled) setDetailWaypointsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [type, detailRide])
+
+  useEffect(() => {
+    if (type !== "create") return
+    const s = (createDraft.start || "").trim()
+    const d = (createDraft.destination || "").trim()
+    if (!s || !d) {
+      setCreateWaypointsList([])
+      setCreateWaypointsLoading(false)
+      return
+    }
+    let cancelled = false
+    setCreateWaypointsLoading(true)
+    const timer = window.setTimeout(() => {
+      fetchRouteWaypointsFromMapBackend({
+        start: s,
+        destination: d,
+        fallbackWaypoints: createDraft.waypoints,
+      })
+        .then((res) => {
+          if (cancelled) return
+          const safeList = Array.isArray(res?.waypointsList)
+            ? res.waypointsList
+            : []
+          setCreateWaypointsList(safeList)
+          setCreateDraft((prev) => ({
+            ...prev,
+            waypoints: res?.formatted || DIRECT_ROUTE_LABEL,
+            estimatedDuration: String(
+              res?.estimatedDurationMinutes || DEFAULT_ESTIMATED_DURATION,
+            ),
+          }))
+        })
+        .catch(() => {
+          if (!cancelled) setCreateWaypointsList([])
+        })
+        .finally(() => {
+          if (!cancelled) setCreateWaypointsLoading(false)
+        })
+    }, 280)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [type, createDraft.start, createDraft.destination])
+
+  useEffect(() => {
+    if (type !== "route-edit") return
+    const s = (routeDraft.start || "").trim()
+    const d = (routeDraft.destination || "").trim()
+    if (!s || !d) {
+      setRouteWaypointsList([])
+      setRouteWaypointsLoading(false)
+      return
+    }
+    let cancelled = false
+    setRouteWaypointsLoading(true)
+    const timer = window.setTimeout(() => {
+      fetchRouteWaypointsFromMapBackend({
+        start: s,
+        destination: d,
+        fallbackWaypoints: routeDraft.waypointsList ?? routeDraft.waypoint,
+      })
+        .then((res) => {
+          if (cancelled) return
+          const safeList = Array.isArray(res?.waypointsList)
+            ? res.waypointsList
+            : []
+          setRouteWaypointsList(safeList)
+          setRouteDraft((prev) => ({
+            ...prev,
+            waypoint: res?.formatted || DIRECT_ROUTE_LABEL,
+            waypointsList: safeList,
+          }))
+        })
+        .catch(() => {
+          if (!cancelled) setRouteWaypointsList([])
+        })
+        .finally(() => {
+          if (!cancelled) setRouteWaypointsLoading(false)
+        })
+    }, 280)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [type, routeDraft.start, routeDraft.destination])
   const calendarYear = calendarView.getFullYear()
   const calendarMonth = calendarView.getMonth() + 1
   const calendarStartDay = new Date(calendarYear, calendarMonth - 1, 1).getDay()
@@ -4871,7 +6854,33 @@ function SheetView({
               <div className="match-results">
                 {sheetMatches.map((ride) => (
                   <article className="match-result-card" key={ride.id}>
-                    <div className="ride-top">
+                    <div
+                      className="ride-top clickable-profile-trigger"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${ride.name} 운전자 프로필 상세 보기`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: ride.name,
+                          role: "driver",
+                          carInfo: ride.car,
+                          rating: ride.rating,
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            name: ride.name,
+                            role: "driver",
+                            carInfo: ride.car,
+                            rating: ride.rating,
+                          })
+                        }
+                      }}
+                    >
                       <div className="avatar">{ride.name.slice(0, 1)}</div>
                       <div>
                         <strong>
@@ -4889,7 +6898,13 @@ function SheetView({
                           <small>5월 20일 · {ride.time}</small>
                         </span>
                       </div>
-                      <div className="via">경유 · {ride.via}</div>
+                      <div className="via">
+                      경유 ·{" "}
+                      {Array.isArray(ride?.waypointsList) &&
+                      ride.waypointsList.length > 0
+                        ? ride.waypointsList.join(" · ")
+                        : ride?.via || DIRECT_ROUTE_LABEL}
+                    </div>
                       <div>
                         <i />
                         <span>
@@ -4918,12 +6933,43 @@ function SheetView({
                       </span>
                       <strong>{ride.price.toLocaleString()} P</strong>
                     </div>
-                    <Button
-                      disabled={isRideApplied(ride)}
-                      onClick={() => applyToMatchRide(ride)}
-                    >
-                      {isRideApplied(ride) ? "신청 완료" : "탑승 신청"}
-                    </Button>
+                    <div className="match-card-actions">
+                      <Button
+                        type="button"
+                        variant="soft"
+                        onClick={() =>
+                          onStartCarpoolChat(
+                            {
+                              id: ride.driverId || `account-${ride.name}`,
+                              name: ride.name,
+                              role: "driver",
+                              carInfo: ride.car,
+                              licenseVerified: true,
+                            },
+                            {
+                              id: ride.flowRideId || ride.id,
+                              start: ride.start,
+                              destination: ride.end,
+                              date: ride.date,
+                              time: ride.time,
+                              waypoints:
+                                Array.isArray(ride?.waypointsList) &&
+                                ride.waypointsList.length > 0
+                                  ? ride.waypointsList.join(" · ")
+                                  : ride?.via || DIRECT_ROUTE_LABEL,
+                            },
+                          )
+                        }
+                      >
+                        <MessageCircle /> 채팅 문의
+                      </Button>
+                      <Button
+                        disabled={isRideApplied(ride)}
+                        onClick={() => applyToMatchRide(ride)}
+                      >
+                        {isRideApplied(ride) ? "신청 완료" : "탑승 신청"}
+                      </Button>
+                    </div>
                   </article>
                 ))}
               </div>
@@ -4941,7 +6987,33 @@ function SheetView({
         )}
         {type === "ride" && detailRide && (
           <div className="sheet-content ride-detail">
-            <div className="driver-profile">
+            <div
+              className="driver-profile clickable-profile-trigger"
+              role="button"
+              tabIndex={0}
+              aria-label={`${detailRide.name} 운전자 프로필 상세 보기`}
+              onClick={(event) => {
+                event.stopPropagation()
+                onViewUserProfile({
+                  name: detailRide.name,
+                  role: "driver",
+                  carInfo: detailRide.car,
+                  rating: detailRide.rating,
+                })
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    name: detailRide.name,
+                    role: "driver",
+                    carInfo: detailRide.car,
+                    rating: detailRide.rating,
+                  })
+                }
+              }}
+            >
               <div className="avatar large">{detailRide.name.slice(0, 1)}</div>
               <div>
                 <h2>
@@ -4949,7 +7021,8 @@ function SheetView({
                 </h2>
                 <p>{detailRide.car} · 면허 및 차량 데모 확인</p>
                 <span>
-                  <Star /> {detailRide.rating} · 후기 {detailRide.reviews}개
+                  <Star /> {detailRide.rating} · 후기 {detailRide.reviews}개 ·
+                  프로필 상세보기
                 </span>
               </div>
             </div>
@@ -4958,6 +7031,13 @@ function SheetView({
                 ...route,
                 start: detailRide.start,
                 destination: detailRide.end,
+                waypoint:
+                  Array.isArray(detailWaypoints) && detailWaypoints.length > 0
+                    ? detailWaypoints.join(" · ")
+                    : detailRide.via,
+                waypointsList: Array.isArray(detailWaypoints)
+                  ? detailWaypoints
+                  : [],
               }}
             />
             <div className="detail-grid">
@@ -5011,20 +7091,128 @@ function SheetView({
                 {detailRide.start}에서 만나요.
               </p>
             </div>
+            <h3>확정 동승자</h3>
+            <div className="co-passengers-list">
+              {[
+                ...carpoolFlow.applications
+                  .filter(
+                    (app) =>
+                      (app.rideId === detailRide.flowRideId ||
+                        app.rideId === detailRide.id) &&
+                      app.status === "승인 완료",
+                  )
+                  .map((app) => ({
+                    id: app.riderId,
+                    name: app.riderName,
+                    badge: "매너 탑승자",
+                  })),
+                { id: "rider-seoyeon", name: "이서연", badge: "매너 탑승자" },
+                { id: "rider-woojin", name: "정우진", badge: "시간 엄수" },
+              ]
+                .filter(
+                  (passenger, idx, arr) =>
+                    arr.findIndex((item) => item.name === passenger.name) ===
+                    idx,
+                )
+                .map((passenger) => (
+                  <div
+                    className="co-passenger-chip clickable-profile-trigger"
+                    key={passenger.id}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${passenger.name} 탑승자 프로필 상세 보기`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        id: passenger.id,
+                        name: passenger.name,
+                        role: "rider",
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: passenger.id,
+                          name: passenger.name,
+                          role: "rider",
+                        })
+                      }
+                    }}
+                  >
+                    <div className="avatar small green">
+                      {passenger.name.slice(0, 1)}
+                    </div>
+                    <div>
+                      <strong>{passenger.name}</strong>
+                      <small>{passenger.badge} · 프로필 보기</small>
+                    </div>
+                  </div>
+                ))}
+            </div>
             <h3>주요 경유지</h3>
-            <p className="waypoints">{detailRide.via}</p>
-            <Button
-              onClick={() => applyToMatchRide(detailRide)}
-              disabled={isRideApplied(detailRide)}
-            >
-              {isRideApplied(detailRide) ? (
-                <>
-                  <Check /> 신청이 완료됐어요
-                </>
-              ) : (
-                `${detailRide.price.toLocaleString()} P로 탑승 신청`
-              )}
-            </Button>
+            {detailWaypointsLoading ? (
+              <p className="waypoints">
+                실제 지도 경로에서 주요 경유지를 불러오는 중...
+              </p>
+            ) : Array.isArray(detailWaypoints) && detailWaypoints.length > 0 ? (
+              <div className="waypoints-chip-box">
+                <div className="waypoints-chip-list">
+                  {(detailWaypoints ?? []).map((wp, idx) => (
+                    <span className="waypoint-node-pill" key={`${wp}-${idx}`}>
+                      <MapPin /> {wp}
+                    </span>
+                  ))}
+                </div>
+                <p className="waypoints">{detailWaypoints.join(" · ")}</p>
+              </div>
+            ) : (
+              <p className="waypoints">{DIRECT_ROUTE_LABEL}</p>
+            )}
+            <div className="ride-detail-cta-group">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() =>
+                  onStartCarpoolChat(
+                    {
+                      id: detailRide.driverId || `account-${detailRide.name}`,
+                      name: detailRide.name,
+                      role: "driver",
+                      carInfo: detailRide.car,
+                      licenseVerified: true,
+                    },
+                    {
+                      id: detailRide.flowRideId || detailRide.id,
+                      start: detailRide.start,
+                      destination: detailRide.end,
+                      date: detailRide.date,
+                      time: detailRide.time,
+                      waypoints:
+                        Array.isArray(detailWaypoints) &&
+                        detailWaypoints.length > 0
+                          ? detailWaypoints.join(" · ")
+                          : detailRide.via || DIRECT_ROUTE_LABEL,
+                    },
+                  )
+                }
+              >
+                <MessageCircle /> 운전자와 1:1 채팅하기
+              </Button>
+              <Button
+                onClick={() => applyToMatchRide(detailRide)}
+                disabled={isRideApplied(detailRide)}
+              >
+                {isRideApplied(detailRide) ? (
+                  <>
+                    <Check /> 신청이 완료됐어요
+                  </>
+                ) : (
+                  `${detailRide.price.toLocaleString()} P로 탑승 신청`
+                )}
+              </Button>
+            </div>
           </div>
         )}
         {type === "create" && (
@@ -5102,7 +7290,7 @@ function SheetView({
               icon={<Navigation />}
             />
             <Field
-              label="주요 경유지"
+              label="주요 경유지 (지도 경로 자동 추출)"
               value={createDraft.waypoints}
               onChange={(event) =>
                 setCreateDraft({
@@ -5110,9 +7298,25 @@ function SheetView({
                   waypoints: event.target.value,
                 })
               }
-              placeholder="예: 태평역, 성남시청"
+              placeholder="출발지·목적지 입력 시 실제 경로 경유지가 자동 추출됩니다"
               icon={<MapPin />}
             />
+            {createWaypointsLoading ? (
+              <small className="waypoint-extract-status">
+                지도 경로 데이터를 기반으로 실제 주요 경유지를 추출하고 있습니다...
+              </small>
+            ) : (
+              Array.isArray(createWaypointsList) &&
+              createWaypointsList.length > 0 && (
+                <div className="waypoints-chip-list">
+                  {(createWaypointsList ?? []).map((wp, idx) => (
+                    <span className="waypoint-node-pill" key={`${wp}-${idx}`}>
+                      <MapPin /> {wp}
+                    </span>
+                  ))}
+                </div>
+              )
+            )}
             <div className="eta-preview">
               <Clock3 />
               <div>
@@ -5377,7 +7581,33 @@ function SheetView({
                         {ride.start} → {ride.destination}
                       </h3>
                       <p>
-                        {ride.date} · {ride.time} · {ride.driverName}
+                        {ride.date} · {ride.time} ·{" "}
+                        <span
+                          className="clickable-profile-inline"
+                          role="button"
+                          tabIndex={0}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            onViewUserProfile({
+                              name: ride.driverName,
+                              role: "driver",
+                              carInfo: ride.vehicle,
+                            })
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              onViewUserProfile({
+                                name: ride.driverName,
+                                role: "driver",
+                                carInfo: ride.vehicle,
+                              })
+                            }
+                          }}
+                        >
+                          {ride.driverName} 운전자
+                        </span>
                       </p>
                       <small>
                         잔여 {getRemainingSeats(carpoolFlow, ride.id)}석 ·{" "}
@@ -5479,12 +7709,12 @@ function SheetView({
             {[
               [
                 "탑승 신청이 도착했어요",
-                "박민지님이 5월 20일 카풀에 신청했어요.",
+                "학우님이 5월 20일 카풀에 신청했어요.",
                 "방금 전",
               ],
               [
                 "카풀이 승인되었어요",
-                "김도윤 운전자가 신청을 승인했어요.",
+                "운전자가 카풀 신청을 승인했어요.",
                 "1시간 전",
               ],
               [
@@ -5493,7 +7723,15 @@ function SheetView({
                 "어제",
               ],
             ].map((n, i) => (
-              <button key={n[0]} onClick={() => alert(`${n[0]}\n${n[1]}`)}>
+              <button
+                key={n[0]}
+                onClick={() => {
+                  void showAppAlert({
+                    title: n[0],
+                    message: n[1],
+                  })
+                }}
+              >
                 <span className={i === 0 ? "new" : ""}>
                   {i === 0 ? <UsersRound /> : i === 1 ? <Check /> : <Bell />}
                 </span>
@@ -5543,10 +7781,35 @@ function SheetView({
                   </p>
                 </div>
                 <section className="payment-trip-card">
-                  <div className="driver-profile">
-                    <div className="avatar large">김</div>
+                  <div
+                    className="driver-profile clickable-profile-trigger"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: tripFlow.driverName || "운전자",
+                        role: "driver",
+                        carInfo: tripFlow.vehicle,
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: tripFlow.driverName || "운전자",
+                          role: "driver",
+                          carInfo: tripFlow.vehicle,
+                        })
+                      }
+                    }}
+                  >
+                    <div className="avatar large">
+                      {(tripFlow.driverName || "운")[0]}
+                    </div>
                     <div>
-                      <h2>{tripFlow.driverName} 운전자</h2>
+                      <h2>{tripFlow.driverName || "운전자"} 운전자</h2>
                       <p>{tripFlow.vehicle}</p>
                       <span className="tag waiting">{tripFlow.status}</span>
                     </div>
@@ -6098,7 +8361,46 @@ function SheetView({
                         ? "완료된 카풀"
                         : application.status}
                     </span>
-                    <h3>
+                    <h3
+                      className="clickable-profile-inline"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (role === "driver") {
+                          onViewUserProfile({
+                            id: application.riderId,
+                            name: application.riderName,
+                            role: "rider",
+                          })
+                        } else {
+                          onViewUserProfile({
+                            name: ride.driverName,
+                            role: "driver",
+                            carInfo: ride.vehicle,
+                          })
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          if (role === "driver") {
+                            onViewUserProfile({
+                              id: application.riderId,
+                              name: application.riderName,
+                              role: "rider",
+                            })
+                          } else {
+                            onViewUserProfile({
+                              name: ride.driverName,
+                              role: "driver",
+                              carInfo: ride.vehicle,
+                            })
+                          }
+                        }
+                      }}
+                    >
                       {role === "driver"
                         ? `${application.riderName} 탑승 신청`
                         : `${ride.driverName} 운전자`}
@@ -6107,10 +8409,54 @@ function SheetView({
                       {ride.start} → {ride.destination}
                     </p>
                     <small>
+                      주요 경유지 ·{" "}
+                      {Array.isArray(ride?.waypointsList) &&
+                      ride.waypointsList.length > 0
+                        ? ride.waypointsList.join(" · ")
+                        : ride.waypoints || DIRECT_ROUTE_LABEL}
+                    </small>
+                    <small>
                       {ride.date} {ride.time} · {ride.price.toLocaleString()} P
                       ·{" "}
                       {new Date(application.createdAt).toLocaleString("ko-KR")}
                     </small>
+                    <div className="application-card-actions">
+                      <Button
+                        type="button"
+                        variant="soft"
+                        onClick={() =>
+                          onStartCarpoolChat(
+                            role === "driver"
+                              ? {
+                                  id:
+                                    application.riderId ||
+                                    `account-${application.riderName}`,
+                                  name: application.riderName,
+                                  role: "rider",
+                                }
+                              : {
+                                  id:
+                                    ride.driverId ||
+                                    `account-${ride.driverName}`,
+                                  name: ride.driverName,
+                                  role: "driver",
+                                  carInfo: ride.vehicle,
+                                  licenseVerified: true,
+                                },
+                            {
+                              id: ride.id,
+                              start: ride.start,
+                              destination: ride.destination,
+                              date: ride.date,
+                              time: ride.time,
+                              waypoints: ride.waypoints || DIRECT_ROUTE_LABEL,
+                            },
+                          )
+                        }
+                      >
+                        <MessageCircle /> 1:1 채팅하기
+                      </Button>
+                    </div>
                     {role === "driver" &&
                       application.status === "승인 대기" && (
                         <div>
@@ -6139,9 +8485,15 @@ function SheetView({
                         application.status === "승인 완료") && (
                         <Button
                           variant="ghost"
-                          onClick={() => {
-                            if (!window.confirm("카풀 예약을 취소할까요?"))
-                              return
+                          onClick={async () => {
+                            const ok = await showAppConfirm({
+                              title: "예약 취소 확인",
+                              message: "카풀 예약을 취소할까요?",
+                              confirmText: "예약 취소",
+                              cancelText: "돌아가기",
+                              variant: "danger",
+                            })
+                            if (!ok) return
                             cancelCarpoolApplication(application.id)
                           }}
                         >
@@ -6170,8 +8522,29 @@ function SheetView({
                   >
                     {applicationCancelled ? "취소" : "승인 대기"}
                   </span>
-                  <h3>
-                    {role === "driver" ? "박민지 탑승 신청" : "김도윤 운전자"}
+                  <h3
+                    className="clickable-profile-inline"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: role === "driver" ? "탑승자" : "운전자",
+                        role: role === "driver" ? "rider" : "driver",
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: role === "driver" ? "탑승자" : "운전자",
+                          role: role === "driver" ? "rider" : "driver",
+                        })
+                      }
+                    }}
+                  >
+                    {role === "driver" ? "탑승 신청" : "카풀 운전자"}
                   </h3>
                   <p>태평역 → 신구대학교</p>
                   <small>5월 21일 오전 8:15 · 2,800 P · 잔여 1석</small>
@@ -6185,8 +8558,15 @@ function SheetView({
                     <Button
                       variant="ghost"
                       disabled={applicationCancelled}
-                      onClick={() => {
-                        if (window.confirm("탑승 신청을 취소할까요?")) {
+                      onClick={async () => {
+                        const ok = await showAppConfirm({
+                          title: "신청 취소 확인",
+                          message: "탑승 신청을 취소할까요?",
+                          confirmText: "신청 취소",
+                          cancelText: "돌아가기",
+                          variant: "danger",
+                        })
+                        if (ok) {
                           writeDemoValue("application-0521", "cancelled")
                           setApplicationCancelled(true)
                         }
@@ -6201,7 +8581,30 @@ function SheetView({
                 applicationFilter === "탑승 완료") && (
                 <article>
                   <span className="tag open">탑승 완료</span>
-                  <h3>김도윤 운전자</h3>
+                  <h3
+                    className="clickable-profile-inline"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: "운전자",
+                        role: "driver",
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: "운전자",
+                          role: "driver",
+                        })
+                      }
+                    }}
+                  >
+                    운전자
+                  </h3>
                   <p>모란역 → 신구대학교</p>
                   <small>5월 16일 오전 8:10 · 결제 완료</small>
                   <Button variant="soft" onClick={() => open("review")}>
@@ -6214,13 +8617,38 @@ function SheetView({
         )}
         {type === "application-detail" && (
           <div className="sheet-content ride-detail">
-            <div className="driver-profile">
-              <div className="avatar large">김</div>
+            <div
+              className="driver-profile clickable-profile-trigger"
+              role="button"
+              tabIndex={0}
+              onClick={(event) => {
+                event.stopPropagation()
+                onViewUserProfile({
+                  name: latestApplicationRide?.driverName || "운전자",
+                  role: "driver",
+                  carInfo: latestApplicationRide?.vehicle,
+                })
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    name: latestApplicationRide?.driverName || "운전자",
+                    role: "driver",
+                    carInfo: latestApplicationRide?.vehicle,
+                  })
+                }
+              }}
+            >
+              <div className="avatar large">
+                {(latestApplicationRide?.driverName || "운")[0]}
+              </div>
               <div>
                 <h2>
-                  김도윤 <ShieldCheck />
+                  {latestApplicationRide?.driverName || "운전자"} <ShieldCheck />
                 </h2>
-                <p>흰색 현대 아반떼 · 면허 데모 확인</p>
+                <p>{latestApplicationRide?.vehicle || "면허 인증 완료"}</p>
                 <span className="tag waiting">
                   {applicationCancelled ? "취소" : "승인 대기"}
                 </span>
@@ -6241,15 +8669,58 @@ function SheetView({
                 </span>
               </div>
             </div>
-            <Field label="주요 경유지" value="태평역 · 성남시청" readOnly />
-            <Button variant="soft" disabled>
-              승인 후 채팅방 이동 가능
+            <Field
+              label="주요 경유지"
+              value={
+                getExtractedWaypointsSync(
+                  route.start || "태평역",
+                  route.destination || "신구대학교",
+                  route.waypointsList ?? route.waypoint,
+                ).formatted || DIRECT_ROUTE_LABEL
+              }
+              readOnly
+            />
+            <Button
+              variant="soft"
+              onClick={() =>
+                onStartCarpoolChat(
+                  {
+                    id: latestApplicationRide?.driverId || "driver",
+                    name: latestApplicationRide?.driverName || "운전자",
+                    role: "driver",
+                    carInfo: latestApplicationRide?.vehicle || "면허 인증 완료",
+                    licenseVerified: true,
+                  },
+                  {
+                    id: "application-0521",
+                    start: route.start || "태평역",
+                    destination: route.destination || "신구대학교",
+                    date: "5월 21일",
+                    time: "08:15",
+                    waypoints:
+                      getExtractedWaypointsSync(
+                        route.start || "태평역",
+                        route.destination || "신구대학교",
+                        route.waypointsList ?? route.waypoint,
+                      ).formatted || DIRECT_ROUTE_LABEL,
+                  },
+                )
+              }
+            >
+              <MessageCircle /> 운전자와 1:1 채팅하기
             </Button>
             <Button
               variant="ghost"
               disabled={applicationCancelled}
-              onClick={() => {
-                if (window.confirm("탑승 신청을 취소할까요?")) {
+              onClick={async () => {
+                const ok = await showAppConfirm({
+                  title: "신청 취소 확인",
+                  message: "탑승 신청을 취소할까요?",
+                  confirmText: "신청 취소",
+                  cancelText: "돌아가기",
+                  variant: "danger",
+                })
+                if (ok) {
                   writeDemoValue("application-0521", "cancelled")
                   setApplicationCancelled(true)
                 }
@@ -6367,8 +8838,33 @@ function SheetView({
                         {ride.start} → {ride.destination}
                       </strong>
                       <small>
-                        {ride.driverName} 운전자 ·{" "}
-                        {formatEtaTime(ride.estimatedArrival)} 도착 예정 · 약{" "}
+                        <span
+                          className="clickable-profile-inline"
+                          role="button"
+                          tabIndex={0}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            onViewUserProfile({
+                              name: ride.driverName,
+                              role: "driver",
+                              carInfo: ride.vehicle,
+                            })
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              onViewUserProfile({
+                                name: ride.driverName,
+                                role: "driver",
+                                carInfo: ride.vehicle,
+                              })
+                            }
+                          }}
+                        >
+                          {ride.driverName} 운전자
+                        </span>{" "}
+                        · {formatEtaTime(ride.estimatedArrival)} 도착 예정 · 약{" "}
                         {ride.estimatedDuration}분
                       </small>
                     </div>
@@ -6407,9 +8903,15 @@ function SheetView({
               icon={<Navigation />}
             />
             <Field
-              label={role === "driver" ? "주요 거점" : "선호 탑승 장소"}
+              label={
+                role === "driver"
+                  ? "주요 경유지 (지도 경로 자동 추출)"
+                  : "선호 탑승 장소 / 주요 경유지"
+              }
               value={
-                role === "driver" ? routeDraft.waypoint : routeDraft.pickup
+                role === "driver"
+                  ? routeDraft.waypoint
+                  : routeDraft.pickup || routeDraft.waypoint
               }
               onChange={(event) => {
                 setRouteDraft({
@@ -6419,8 +8921,25 @@ function SheetView({
                 })
                 setRouteDirty(true)
               }}
+              placeholder="출발지·목적지 입력 시 실제 경로 경유지가 자동 추출됩니다"
               icon={<MapPin />}
             />
+            {routeWaypointsLoading ? (
+              <small className="waypoint-extract-status">
+                지도 경로 데이터를 기반으로 실제 주요 경유지를 추출하고 있습니다...
+              </small>
+            ) : (
+              Array.isArray(routeWaypointsList) &&
+              routeWaypointsList.length > 0 && (
+                <div className="waypoints-chip-list">
+                  {(routeWaypointsList ?? []).map((wp, idx) => (
+                    <span className="waypoint-node-pill" key={`${wp}-${idx}`}>
+                      <MapPin /> {wp}
+                    </span>
+                  ))}
+                </div>
+              )
+            )}
             <div className="field">
               <span>희망 출발 시간대</span>
               <button
@@ -6435,34 +8954,58 @@ function SheetView({
                 </span>
               </button>
             </div>
-            {role === "rider" && (
-              <div className="field">
-                <span>희망 도착 시간 · 선택</span>
-                <button
-                  type="button"
-                  className="field__control custom-picker-trigger"
-                  onClick={() => setRouteArrivalPickerOpen(true)}
-                >
-                  <Navigation />
-                  <span>
-                    {routeDraft.preferredArrival
-                      ? `${formatKoreanTimeLabel(routeDraft.preferredArrival)} (${routeDraft.preferredArrival})`
-                      : "희망 도착 시간 선택"}
-                  </span>
-                </button>
+            <div className="field">
+              <span>희망 도착 시간</span>
+              <button
+                type="button"
+                className="field__control custom-picker-trigger"
+                onClick={() => setRouteArrivalPickerOpen(true)}
+              >
+                <Navigation />
+                <span>
+                  {routeDraft.preferredArrival
+                    ? `${formatKoreanTimeLabel(routeDraft.preferredArrival)} (${routeDraft.preferredArrival})`
+                    : `${formatKoreanTimeLabel(
+                        resolveValidArrivalTime24(
+                          routeDraft.departureTime || "08:30",
+                        ).arrival24,
+                      )} (${
+                        resolveValidArrivalTime24(
+                          routeDraft.departureTime || "08:30",
+                        ).arrival24
+                      })`}
+                </span>
+              </button>
+            </div>
+            {routeTimeAutoNotice && (
+              <div className="email-code-notice time-auto-adjust-banner">
+                <Clock3 />
+                <span>{routeTimeAutoNotice}</span>
               </div>
             )}
             <CustomTimePickerModal
               isOpen={routeDeparturePickerOpen}
               value={routeDraft.departureTime || "08:30"}
+              maxTime24="23:58"
               title="희망 출발 시간 설정"
+              subtitle="출발 시간이 도착 시간과 같거나 늦으면 도착 시간이 자동으로 이후 시간대로 조정됩니다."
               onClose={() => setRouteDeparturePickerOpen(false)}
               onConfirm={(nextTime) => {
-                const nextArrival = addMinutesToTime24(nextTime, 30)
+                const resolved = resolveValidArrivalTime24(
+                  nextTime,
+                  routeDraft.preferredArrival,
+                )
                 const nextDraft: RouteData = {
                   ...routeDraft,
-                  departureTime: nextTime,
-                  preferredArrival: nextArrival,
+                  departureTime: resolved.departure24,
+                  preferredArrival: resolved.arrival24,
+                }
+                if (resolved.autoAdjusted) {
+                  setRouteTimeAutoNotice(
+                    `출발 시간이 변경되어 도착 시간이 ${formatKoreanTimeLabel(resolved.arrival24)}(${resolved.arrival24})으로 자동 조정되었습니다.`,
+                  )
+                } else {
+                  setRouteTimeAutoNotice("")
                 }
                 setRouteDraft(nextDraft)
                 setRouteDirty(true)
@@ -6473,15 +9016,30 @@ function SheetView({
               isOpen={routeArrivalPickerOpen}
               value={
                 routeDraft.preferredArrival ||
-                addMinutesToTime24(routeDraft.departureTime || "08:30", 30)
+                resolveValidArrivalTime24(routeDraft.departureTime || "08:30")
+                  .arrival24
               }
+              minTime24={routeDraft.departureTime || "08:30"}
               title="희망 도착 시간 설정"
+              subtitle={`현재 출발 시간(${formatKoreanTimeLabel(routeDraft.departureTime || "08:30")} · ${routeDraft.departureTime || "08:30"})보다 이후 시간만 선택할 수 있습니다.`}
               onClose={() => setRouteArrivalPickerOpen(false)}
               onConfirm={(nextTime) => {
+                if (
+                  !isValidDepartureAndArrival(
+                    routeDraft.departureTime || "08:30",
+                    nextTime,
+                  )
+                ) {
+                  setRouteTimeAlert(
+                    "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                  )
+                  return
+                }
                 const nextDraft: RouteData = {
                   ...routeDraft,
                   preferredArrival: nextTime,
                 }
+                setRouteTimeAutoNotice("")
                 setRouteDraft(nextDraft)
                 setRouteDirty(true)
                 onSaveRoute(nextDraft)
@@ -6554,6 +9112,7 @@ function SheetView({
                 variant="ghost"
                 onClick={() => {
                   setRouteDraft(defaultRoutes[role])
+                  setRouteTimeAutoNotice("")
                   setRouteDirty(true)
                 }}
               >
@@ -6561,9 +9120,17 @@ function SheetView({
               </Button>
               <Button
                 variant="soft"
-                onClick={() => {
-                  if (routeDirty && !window.confirm("변경 사항을 취소할까요?"))
-                    return
+                onClick={async () => {
+                  if (routeDirty) {
+                    const ok = await showAppConfirm({
+                      title: "변경 사항 취소",
+                      message: "변경 사항을 취소할까요?",
+                      confirmText: "변경 취소",
+                      cancelText: "계속 편집",
+                      variant: "danger",
+                    })
+                    if (!ok) return
+                  }
                   close()
                 }}
               >
@@ -6571,7 +9138,21 @@ function SheetView({
               </Button>
               <Button
                 onClick={() => {
-                  onSaveRoute(routeDraft)
+                  const dep = routeDraft.departureTime || "08:30"
+                  const arr =
+                    routeDraft.preferredArrival ||
+                    resolveValidArrivalTime24(dep).arrival24
+                  if (!isValidDepartureAndArrival(dep, arr)) {
+                    setRouteTimeAlert(
+                      "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                    )
+                    return
+                  }
+                  onSaveRoute({
+                    ...routeDraft,
+                    departureTime: dep,
+                    preferredArrival: arr,
+                  })
                   setRouteDirty(false)
                   close()
                 }}
@@ -6579,6 +9160,30 @@ function SheetView({
                 저장
               </Button>
             </div>
+            {routeTimeAlert && (
+              <div
+                className="dialog-backdrop flow-dialog-backdrop time-validation-alert-backdrop"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget)
+                    setRouteTimeAlert("")
+                }}
+              >
+                <section
+                  className="app-dialog"
+                  role="alertdialog"
+                  aria-modal="true"
+                >
+                  <span className="dialog-icon neutral">
+                    <Clock3 />
+                  </span>
+                  <h2>시간 설정 안내</h2>
+                  <p>{routeTimeAlert}</p>
+                  <Button type="button" onClick={() => setRouteTimeAlert("")}>
+                    확인
+                  </Button>
+                </section>
+              </div>
+            )}
           </div>
         )}
         {(type === "account" || type === "account-edit") && (
@@ -6635,11 +9240,14 @@ function SheetView({
               )}
               <Field
                 label="전화번호"
+                type="tel"
+                placeholder="예: 01012345678 ('-' 없이 숫자만 입력)"
+                maxLength={13}
                 value={accountDraft.phone}
                 onChange={(event) =>
                   setAccountDraft({
                     ...accountDraft,
-                    phone: event.target.value,
+                    phone: event.target.value.replace(/[^0-9-]/g, "").slice(0, 13),
                   })
                 }
                 disabled={!isEditingAccount}
@@ -6725,12 +9333,20 @@ function SheetView({
               )}
               {isEditingAccount && (
                 <Button
-                  onClick={() => {
-                    if (!/^010-\d{4}-\d{4}$/.test(accountDraft.phone)) {
-                      alert("전화번호 형식을 확인해 주세요.")
+                  onClick={async () => {
+                    const cleanPhone = accountDraft.phone.trim()
+                    if (!cleanPhone || !isValidPhoneNumber(cleanPhone)) {
+                      await showAppAlert({
+                        title: "형식 확인",
+                        message: "올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+                      })
                       return
                     }
-                    onSaveAccount(accountDraft)
+                    const normalized = {
+                      ...accountDraft,
+                      phone: normalizePhoneNumber(cleanPhone),
+                    }
+                    onSaveAccount(normalized)
                     onSaveBadges(role, badgeDraft)
                     setEditingAccount(false)
                     setProfileSaved(true)
@@ -6766,10 +9382,35 @@ function SheetView({
             <div className="section-heading">
               <h2>이번 카풀은 어떠셨나요?</h2>
             </div>
-            <div className="driver-profile">
-              <div className="avatar large">김</div>
+            <div
+              className="driver-profile clickable-profile-trigger"
+              role="button"
+              tabIndex={0}
+              onClick={(event) => {
+                event.stopPropagation()
+                onViewUserProfile({
+                  name: reviewRide?.driverName || "운전자",
+                  role: "driver",
+                  carInfo: reviewRide?.vehicle,
+                })
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  onViewUserProfile({
+                    name: reviewRide?.driverName || "운전자",
+                    role: "driver",
+                    carInfo: reviewRide?.vehicle,
+                  })
+                }
+              }}
+            >
+              <div className="avatar large">
+                {(reviewRide?.driverName || "운")[0]}
+              </div>
               <div>
-                <h2>김도윤 운전자</h2>
+                <h2>{reviewRide?.driverName || "운전자"} 운전자</h2>
                 <p>
                   {reviewRide
                     ? `${reviewRide.date} · ${reviewRide.start} → ${reviewRide.destination}`
@@ -6835,7 +9476,7 @@ function SheetView({
                     )
                   } else {
                     const review: DemoReview = {
-                      author: "박민지 탑승자 · 작성한 후기",
+                      author: `${account.name || "탑승자"} · 작성한 후기`,
                       date: new Date().toLocaleDateString("ko-KR"),
                       score: rating || 5,
                       text: reviewText.trim(),
@@ -6943,7 +9584,28 @@ function SheetView({
               </div>
               {allReviews.map((reviewItem) => (
                 <article key={`${reviewItem.date}-${reviewItem.score}`}>
-                  <header>
+                  <header
+                    className="clickable-profile-trigger"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onViewUserProfile({
+                        name: reviewItem.author,
+                        role: role === "driver" ? "rider" : "driver",
+                      })
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          name: reviewItem.author,
+                          role: role === "driver" ? "rider" : "driver",
+                        })
+                      }
+                    }}
+                  >
                     <div className="reviewer-avatar">
                       <UserRound />
                     </div>
@@ -7162,8 +9824,56 @@ function SheetView({
               <div className="blocked-list">
                 {blockedUsers.map((user) => (
                   <article key={user.id}>
-                    <div className="avatar">{user.name.slice(0, 1)}</div>
-                    <div>
+                    <div
+                      className="avatar clickable-profile-trigger"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: user.id,
+                          name: user.name,
+                          role: "rider",
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            id: user.id,
+                            name: user.name,
+                            role: "rider",
+                          })
+                        }
+                      }}
+                    >
+                      {user.name.slice(0, 1)}
+                    </div>
+                    <div
+                      className="clickable-profile-trigger"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onViewUserProfile({
+                          id: user.id,
+                          name: user.name,
+                          role: "rider",
+                        })
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            id: user.id,
+                            name: user.name,
+                            role: "rider",
+                          })
+                        }
+                      }}
+                    >
                       <strong>{user.name}</strong>
                       <span>{user.blockedAt} 차단</span>
                     </div>
@@ -7260,7 +9970,37 @@ function SheetView({
                             {report.status}
                           </span>
                           <div>
-                            <strong>
+                            <strong
+                              className="clickable-profile-inline"
+                              role="button"
+                              tabIndex={0}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                onViewUserProfile({
+                                  name: report.targetName,
+                                  role:
+                                    report.targetRole === "운전자"
+                                      ? "driver"
+                                      : "rider",
+                                })
+                              }}
+                              onKeyDown={(event) => {
+                                if (
+                                  event.key === "Enter" ||
+                                  event.key === " "
+                                ) {
+                                  event.preventDefault()
+                                  event.stopPropagation()
+                                  onViewUserProfile({
+                                    name: report.targetName,
+                                    role:
+                                      report.targetRole === "운전자"
+                                        ? "driver"
+                                        : "rider",
+                                  })
+                                }
+                              }}
+                            >
                               {report.targetName} {report.targetRole}
                             </strong>
                             <p>{report.reason}</p>
@@ -8202,6 +10942,7 @@ function SheetView({
   )
 }
 
+
 export default function App() {
   const tripFlow = useSyncExternalStore(
     subscribeTripFlow,
@@ -8263,6 +11004,154 @@ export default function App() {
   })
   const [homeDatePickerOpen, setHomeDatePickerOpen] = useState(false)
   const [homeTimePickerOpen, setHomeTimePickerOpen] = useState(false)
+  const [viewingUserProfile, setViewingUserProfile] =
+    useState<PublicUserProfileData | null>(null)
+  const [chatAlertModal, setChatAlertModal] = useState<{
+    title: string
+    message: string
+    requireLogin?: boolean
+  } | null>(null)
+
+  // Supabase 세션 감지 및 profiles 테이블 Realtime 양방향 동기화
+  useEffect(() => {
+    if (!isSupabaseConfigured()) return
+
+    let unsubscribeRealtime: (() => void) | null = null
+
+    const syncUserSession = async (
+      userId?: string,
+      userEmail?: string,
+      userMeta?: any,
+    ) => {
+      let uid = userId
+      let email = userEmail
+      let meta = userMeta
+
+      if (!uid) {
+        const currentUser = await supabaseGetCurrentUser()
+        if (!currentUser) return
+        uid = currentUser.id
+        email = currentUser.email
+        meta = currentUser.user_metadata || {}
+      }
+
+      setLoggedIn(true)
+      const dbProfile = await supabaseGetProfile(uid)
+      const resolvedProfile: AccountData = dbProfile || {
+        id: uid,
+        loginId: email ? email.split("@")[0] : uid,
+        name: meta?.name || (email ? email.split("@")[0] : "사용자"),
+        email: email || "",
+        phone: meta?.phone || "",
+        gender: meta?.gender || "선택 안 함",
+        role: meta?.role || role,
+        isDriverVerified: Boolean(meta?.isDriverVerified),
+        licenseFileName: meta?.licenseFileName,
+        vehicleName: meta?.vehicleName,
+        vehicleCapacity: meta?.vehicleCapacity
+          ? Number(meta.vehicleCapacity)
+          : undefined,
+      }
+
+      setAccount(resolvedProfile)
+      writeDemoData("account", resolvedProfile)
+      if (resolvedProfile.role && resolvedProfile.role !== role) {
+        setRole(resolvedProfile.role)
+        writeDemoValue("demo-role", resolvedProfile.role)
+      }
+
+      if (unsubscribeRealtime) unsubscribeRealtime()
+      unsubscribeRealtime = subscribeUserProfileRealtime(
+        uid,
+        (realtimeProfile) => {
+          setAccount(realtimeProfile)
+          writeDemoData("account", realtimeProfile)
+          if (realtimeProfile.role && realtimeProfile.role !== role) {
+            setRole(realtimeProfile.role)
+            writeDemoValue("demo-role", realtimeProfile.role)
+          }
+        },
+      )
+    }
+
+    void syncUserSession()
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (
+        (event === "SIGNED_IN" ||
+          event === "USER_UPDATED" ||
+          event === "INITIAL_SESSION") &&
+        session?.user
+      ) {
+        void syncUserSession(
+          session.user.id,
+          session.user.email,
+          session.user.user_metadata,
+        )
+      } else if (event === "SIGNED_OUT") {
+        setLoggedIn(false)
+        if (unsubscribeRealtime) {
+          unsubscribeRealtime()
+          unsubscribeRealtime = null
+        }
+      }
+    })
+
+    return () => {
+      subscription.unsubscribe()
+      if (unsubscribeRealtime) unsubscribeRealtime()
+    }
+  }, [])
+
+  const openUserProfile = (target: PublicUserProfileTarget) => {
+    const resolved = resolvePublicUserProfile(target, carpoolFlow, account)
+    if (resolved) {
+      setViewingUserProfile(resolved)
+    }
+  }
+
+  const handleStartCarpoolChat = (
+    targetUser: CreateOrJoinChatParams["targetUser"],
+    rideInfo: CreateOrJoinChatParams["ride"],
+  ) => {
+    const activeUserId = (account?.id || account?.loginId || "").trim()
+    if (!loggedIn || !activeUserId) {
+      setChatAlertModal({
+        title: "로그인이 필요합니다",
+        message: "채팅 기능을 이용하려면 먼저 로그인해 주세요.",
+        requireLogin: true,
+      })
+      return
+    }
+    const result = getOrCreateCarpoolChatRoom({
+      currentUser: {
+        id: activeUserId,
+        loginId: account?.loginId || activeUserId,
+        name: account?.name || (role === "driver" ? "운전자" : "탑승자"),
+        role,
+        carInfo: account?.vehicleName,
+        isDriverVerified: account?.isDriverVerified,
+      },
+      targetUser,
+      ride: rideInfo,
+    })
+    if (!result.ok) {
+      setChatAlertModal({
+        title:
+          result.reason === "SELF_CHAT_BLOCKED"
+            ? "본인 게시글 채팅 불가"
+            : "채팅 안내",
+        message: result.message,
+        requireLogin: result.reason === "LOGIN_REQUIRED",
+      })
+      return
+    }
+    setSheet(null)
+    setChatTargetRideId(result.room.id)
+    setTab("chat")
+  }
 
   const handleGlobalDateChange = (nextDateKey: string) => {
     setBookingDate(nextDateKey)
@@ -8288,24 +11177,32 @@ export default function App() {
     })
   }
 
-  const handleGlobalTimeChange = (nextTime24: string) => {
-    const nextArrival = addMinutesToTime24(nextTime24, 30)
+  const handleGlobalTimeChange = (
+    nextTime24: string,
+    explicitArrival24?: string,
+  ) => {
+    const resolved = resolveValidArrivalTime24(
+      nextTime24,
+      explicitArrival24 || routesByRole[role].preferredArrival,
+    )
+    const safeDep = resolved.departure24
+    const safeArr = resolved.arrival24
     setRoutesByRole((prev) => {
       const updatedRoleRoute: RouteData = {
         ...prev[role],
-        departureTime: nextTime24,
-        preferredArrival: nextArrival,
+        departureTime: safeDep,
+        preferredArrival: safeArr,
       }
       const updatedAll: Record<Role, RouteData> = {
         rider: {
           ...prev.rider,
-          departureTime: nextTime24,
-          preferredArrival: nextArrival,
+          departureTime: safeDep,
+          preferredArrival: safeArr,
         },
         driver: {
           ...prev.driver,
-          departureTime: nextTime24,
-          preferredArrival: nextArrival,
+          departureTime: safeDep,
+          preferredArrival: safeArr,
         },
         [role]: updatedRoleRoute,
       }
@@ -8315,18 +11212,18 @@ export default function App() {
       }
       return updatedAll
     })
-    updateCarpoolRidesTimeAndDate({ time: nextTime24 })
+    updateCarpoolRidesTimeAndDate({ time: safeDep })
     setSelectedRide((prev) => {
       if (!prev) return null
       const nextEta =
         calculateEstimatedArrival(
           bookingDate,
-          nextTime24,
+          safeDep,
           prev.estimatedDuration || DEFAULT_ESTIMATED_DURATION,
         ) || prev.estimatedArrival
       return {
         ...prev,
-        time: nextTime24,
+        time: safeDep,
         estimatedArrival: nextEta,
       }
     })
@@ -8385,18 +11282,21 @@ export default function App() {
     if (nextEvent) setActiveCarpoolEvent(nextEvent)
   }, [activeCarpoolEvent, carpoolFlow.events, role])
 
-  const activateRole = (next: Role, confirmSchedule = true) => {
+  const activateRole = async (next: Role, confirmSchedule = true) => {
     if (next === role) {
       setSheet(null)
       return
     }
-    if (
-      confirmSchedule &&
-      !window.confirm(
-        "진행 중인 일정과 결제 내역은 그대로 유지됩니다. 역할을 변경할까요?",
-      )
-    )
-      return
+    if (confirmSchedule) {
+      const ok = await showAppConfirm({
+        title: "역할 변경 확인",
+        message:
+          "진행 중인 일정과 결제 내역은 그대로 유지됩니다. 역할을 변경할까요?",
+        confirmText: "역할 변경",
+        cancelText: "취소",
+      })
+      if (!ok) return
+    }
     setRole(next)
     writeDemoValue("demo-role", next)
     setTab("home")
@@ -8439,14 +11339,27 @@ export default function App() {
   const page = useMemo(() => {
     if (tab === "schedule")
       return (
-        <SchedulePage role={role} open={setSheet} carpoolFlow={carpoolFlow} />
+        <SchedulePage
+          role={role}
+          open={setSheet}
+          carpoolFlow={carpoolFlow}
+          onViewUserProfile={openUserProfile}
+        />
       )
     if (tab === "chat")
       return (
         <ChatPage
+          account={account}
+          role={role}
+          loggedIn={loggedIn}
+          onRequireLogin={() => {
+            setLoggedIn(false)
+            setAuth("login")
+          }}
           carpoolFlow={carpoolFlow}
           initialRideId={chatTargetRideId}
           onInitialRideConsumed={() => setChatTargetRideId(null)}
+          onViewUserProfile={openUserProfile}
         />
       )
     if (tab === "profile")
@@ -8490,10 +11403,12 @@ export default function App() {
           setChatTargetRideId(rideId)
           setTab("chat")
         }}
+        onViewUserProfile={openUserProfile}
       />
     ) : (
       <RiderHome
         open={setSheet}
+        account={account}
         route={routesByRole.rider}
         bookingDate={bookingDate}
         onOpenDatePicker={() => setHomeDatePickerOpen(true)}
@@ -8508,6 +11423,7 @@ export default function App() {
           setSelectedRide(ride)
           setSheet("ride")
         }}
+        onViewUserProfile={openUserProfile}
       />
     )
   }, [
@@ -8548,23 +11464,43 @@ export default function App() {
           onLogin={(nextRole, userProfile) => {
             setRole(nextRole)
             setLoggedIn(true)
-            if (userProfile) {
-              const mergedAccount = { ...account, ...userProfile }
-              setAccount(mergedAccount)
-              writeDemoData("account", mergedAccount)
-              if (userProfile.isDriverVerified) {
-                setSelectedBadges((prev) => {
-                  const driverBadges = prev.driver.includes("driver-license")
-                    ? prev.driver
-                    : ["driver-license", ...prev.driver].slice(0, 3)
-                  const nextBadges = {
-                    ...prev,
-                    driver: driverBadges,
-                  }
-                  writeDemoData("selected-badges", nextBadges)
-                  return nextBadges
-                })
-              }
+            const fallbackId = nextRole === "driver" ? "driver" : "student"
+            const fallbackName =
+              userProfile?.name ||
+              account.name ||
+              (nextRole === "driver" ? "운전자" : "학우")
+            const fallbackEmail = `${fallbackId}@shingu.ac.kr`
+            const mergedAccount: AccountData = {
+              ...account,
+              ...userProfile,
+              id:
+                userProfile?.id ||
+                userProfile?.loginId ||
+                account.id ||
+                fallbackId,
+              loginId:
+                userProfile?.loginId ||
+                userProfile?.id ||
+                account.loginId ||
+                account.id ||
+                fallbackId,
+              name: userProfile?.name || account.name || fallbackName,
+              email: userProfile?.email || account.email || fallbackEmail,
+            }
+            setAccount(mergedAccount)
+            writeDemoData("account", mergedAccount)
+            if (mergedAccount.isDriverVerified) {
+              setSelectedBadges((prev) => {
+                const driverBadges = prev.driver.includes("driver-license")
+                  ? prev.driver
+                  : ["driver-license", ...prev.driver].slice(0, 3)
+                const nextBadges = {
+                  ...prev,
+                  driver: driverBadges,
+                }
+                writeDemoData("selected-badges", nextBadges)
+                return nextBadges
+              })
             }
             writeDemoValue("demo-login", "true")
             writeDemoValue("demo-role", nextRole)
@@ -8619,10 +11555,18 @@ export default function App() {
       <CustomTimePickerModal
         isOpen={homeTimePickerOpen}
         value={routesByRole[role].departureTime || "08:30"}
-        title="출발 시간 설정"
-        subtitle="시간을 변경하면 기본 경로, 예약 내역, 상세 카드 등 모든 시간 데이터가 실시간 동기화됩니다."
+        arrivalValue={
+          routesByRole[role].preferredArrival ||
+          resolveValidArrivalTime24(routesByRole[role].departureTime || "08:30")
+            .arrival24
+        }
+        title="출발 · 희망 도착 시간 설정"
+        subtitle="출발 시간과 희망 도착 시간을 설정하면 기본 경로, 예약 내역, 상세 카드 등 모든 시간 데이터가 실시간 동기화됩니다."
         onClose={() => setHomeTimePickerOpen(false)}
         onConfirm={(nextTime24) => handleGlobalTimeChange(nextTime24)}
+        onConfirmRange={(nextDep24, nextArr24) =>
+          handleGlobalTimeChange(nextDep24, nextArr24)
+        }
       />
       {sheet && (
         <SheetView
@@ -8642,34 +11586,76 @@ export default function App() {
           onSelectRole={requestRole}
           onCompleteRole={completeRoleRegistration}
           onSaveRoute={(nextRoute) => {
+            const resolved = resolveValidArrivalTime24(
+              nextRoute.departureTime || "08:30",
+              nextRoute.preferredArrival,
+            )
+            const extractedSync = getExtractedWaypointsSync(
+              nextRoute.start,
+              nextRoute.destination,
+              nextRoute.waypointsList ?? nextRoute.waypoint,
+            )
+            const safeRoute: RouteData = {
+              ...nextRoute,
+              waypoint: extractedSync.formatted || DIRECT_ROUTE_LABEL,
+              waypointsList: extractedSync.waypointsList,
+              departureTime: resolved.departure24,
+              preferredArrival: resolved.arrival24,
+            }
             const updated: Record<Role, RouteData> = {
               ...routesByRole,
               rider: {
                 ...routesByRole.rider,
-                departureTime:
-                  nextRoute.departureTime || routesByRole.rider.departureTime,
+                departureTime: resolved.departure24,
+                preferredArrival: resolved.arrival24,
               },
               driver: {
                 ...routesByRole.driver,
-                departureTime:
-                  nextRoute.departureTime || routesByRole.driver.departureTime,
+                departureTime: resolved.departure24,
+                preferredArrival: resolved.arrival24,
               },
-              [role]: nextRoute,
+              [role]: safeRoute,
             }
             setRoutesByRole(updated)
             writeDemoData("routes", updated)
-            if (nextRoute.departureTime) {
-              updateCarpoolRidesTimeAndDate({ time: nextRoute.departureTime })
-            }
-            if (isSupabaseConfigured()) {
-              supabaseSaveRoute(account.id, role, nextRoute).catch(console.warn)
-            }
+            updateCarpoolRidesTimeAndDate({ time: resolved.departure24 })
+            void fetchRouteWaypointsFromMapBackend({
+              start: safeRoute.start,
+              destination: safeRoute.destination,
+              fallbackWaypoints: safeRoute.waypointsList ?? safeRoute.waypoint,
+            })
+              .then((mapResult) => {
+                const enrichedRoute: RouteData = {
+                  ...safeRoute,
+                  waypoint: mapResult.formatted || safeRoute.waypoint,
+                  waypointsList: mapResult.waypointsList,
+                }
+                setRoutesByRole((prev) => {
+                  const nextAll = { ...prev, [role]: enrichedRoute }
+                  writeDemoData("routes", nextAll)
+                  return nextAll
+                })
+                if (isSupabaseConfigured()) {
+                  supabaseSaveRoute(account.id, role, enrichedRoute).catch(
+                    console.warn,
+                  )
+                }
+              })
+              .catch(console.warn)
           }}
-          onSaveAccount={(nextAccount) => {
+          onSaveAccount={async (nextAccount) => {
             setAccount(nextAccount)
             writeDemoData("account", nextAccount)
             if (isSupabaseConfigured()) {
-              supabaseUpdateProfile(account.id, nextAccount).catch(console.warn)
+              try {
+                const currentUser = await supabaseGetCurrentUser()
+                const targetId = currentUser?.id || nextAccount.id || account.id
+                if (targetId) {
+                  await supabaseUpdateProfile(targetId, nextAccount)
+                }
+              } catch (saveErr) {
+                console.warn("supabaseUpdateProfile error:", saveErr)
+              }
             }
           }}
           onSaveBadges={(badgeRole, badgeIds) => {
@@ -8682,7 +11668,43 @@ export default function App() {
             setSheet(null)
             setTab("home")
           }}
+          onViewUserProfile={openUserProfile}
+          onStartCarpoolChat={handleStartCarpoolChat}
         />
+      )}
+      <UserProfileDetailModal
+        profile={viewingUserProfile}
+        onClose={() => setViewingUserProfile(null)}
+        onSelectUserProfile={openUserProfile}
+      />
+      {chatAlertModal && (
+        <div
+          className="dialog-backdrop flow-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setChatAlertModal(null)
+          }}
+        >
+          <section className="app-dialog" role="alertdialog" aria-modal="true">
+            <span className="dialog-icon neutral">
+              <MessageCircle />
+            </span>
+            <h2>{chatAlertModal.title}</h2>
+            <p>{chatAlertModal.message}</p>
+            <Button
+              type="button"
+              onClick={() => {
+                const shouldGoLogin = chatAlertModal.requireLogin
+                setChatAlertModal(null)
+                if (shouldGoLogin) {
+                  setLoggedIn(false)
+                  setAuth("login")
+                }
+              }}
+            >
+              확인
+            </Button>
+          </section>
+        </div>
       )}
       {activeCarpoolEvent && (
         <div className="dialog-backdrop flow-dialog-backdrop">
@@ -8711,6 +11733,7 @@ export default function App() {
           </section>
         </div>
       )}
+      <GlobalDialog />
     </div>
   )
 }
