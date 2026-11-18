@@ -105,6 +105,7 @@ import {
   subscribeCarpoolFlow,
   updateCarpoolRidesTimeAndDate,
   type DemoCarpoolRide,
+  type DemoCarpoolApplication,
   type DemoCarpoolEvent,
   type DemoCarpoolState,
 } from "./services/demoCarpoolFlow"
@@ -248,6 +249,18 @@ const toFlowMatchRide = (
     ride.destination,
     ride.waypointsList ?? ride.waypoints,
   )
+  const driverReviews = (carpoolFlow.reviews || []).filter(
+    (rev) => rev.targetId === ride.driverId || rev.rideId === ride.id,
+  )
+  const driverRating =
+    driverReviews.length > 0
+      ? Number(
+          (
+            driverReviews.reduce((sum, rev) => sum + (Number(rev.rating) || 0), 0) /
+            driverReviews.length
+          ).toFixed(1),
+        )
+      : 0.0
   return {
     id: `flow-${ride.id}`,
     flowRideId: ride.id,
@@ -269,8 +282,8 @@ const toFlowMatchRide = (
     seats: getRemainingSeats(carpoolFlow, ride.id),
     price: ride.price,
     match: 99,
-    rating: 4.9,
-    reviews: 24,
+    rating: driverRating,
+    reviews: driverReviews.length,
   }
 }
 
@@ -422,27 +435,47 @@ function BadgeGlyph({ badge }: { badge: ProfileBadge }) {
 }
 
 /**
- * 휴대폰 번호 유효성 검사 (하이픈 유무 무관, 순수 숫자 기준 한국 휴대폰 10~11자리)
+ * 휴대폰 번호 실시간 자동 하이픈 포맷팅 (백스페이스 멈춤 방지 포함)
+ */
+function formatPhoneInput(nextRaw: string, prevFormatted = ""): string {
+  if (!nextRaw) return ""
+  let digits = nextRaw.replace(/[^0-9]/g, "").slice(0, 11)
+  const prevDigits = prevFormatted.replace(/[^0-9]/g, "").slice(0, 11)
+  if (
+    prevFormatted &&
+    nextRaw.length < prevFormatted.length &&
+    digits.length === prevDigits.length &&
+    digits.length > 0
+  ) {
+    digits = digits.slice(0, -1)
+  }
+  if (digits.length <= 3) {
+    return digits
+  }
+  if (digits.length <= 7) {
+    return `${digits.slice(0, 3)}-${digits.slice(3)}`
+  }
+  return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7, 11)}`
+}
+
+/**
+ * 휴대폰 번호 유효성 검사 (순수 숫자 11자리 완성 및 한국 휴대폰 번호 패턴 검증)
  */
 function isValidPhoneNumber(raw: string): boolean {
   if (!raw) return false
   const digits = raw.replace(/[^0-9]/g, "")
-  return /^01[016789]\d{7,8}$/.test(digits)
+  return digits.length === 11 && /^01[016789]\d{8}$/.test(digits)
 }
 
 /**
- * 휴대폰 번호 표준 포맷 정규화 (010-XXXX-XXXX 또는 01X-XXX-XXXX)
+ * 휴대폰 번호 표준 포맷 정규화 (010-XXXX-XXXX)
  */
 function normalizePhoneNumber(raw: string): string {
   if (!raw) return ""
-  const digits = raw.replace(/[^0-9]/g, "")
-  if (digits.length === 11) {
-    return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7)}`
-  }
-  if (digits.length === 10) {
-    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`
-  }
-  return raw.trim()
+  const digits = raw.replace(/[^0-9]/g, "").slice(0, 11)
+  if (digits.length <= 3) return digits
+  if (digits.length <= 7) return `${digits.slice(0, 3)}-${digits.slice(3)}`
+  return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7, 11)}`
 }
 
 const WEEKDAY_NAMES_KO = ["일", "월", "화", "수", "목", "금", "토"] as const
@@ -748,124 +781,7 @@ type PublicUserProfileData = {
   reviews: DemoReview[]
 }
 
-const DEMO_USER_PROFILES_DB: Record<string, Partial<PublicUserProfileData>> = {
-  김도윤: {
-    name: "김도윤",
-    role: "driver",
-    emailVerified: true,
-    licenseVerified: true,
-    rating: 4.9,
-    tripCount: 28,
-    carInfo: "흰색 현대 아반떼 · 12가 3456",
-    badges: ["친절한 드라이버", "시간 엄수", "안전운전", "차량 청결"],
-    reviews: [
-      {
-        author: "박민지",
-        date: "2026. 11. 15.",
-        score: 5,
-        text: "출발 시간을 정확히 지켜주시고 운전이 정말 부드러워서 편하게 등교했어요!",
-        tags: ["시간을 잘 지켜요", "안전하게 운전해요"],
-      },
-      {
-        author: "이서연",
-        date: "2026. 11. 12.",
-        score: 5,
-        text: "차량 내부가 깔끔하고 인사도 밝게 해주셔서 아침 통학길이 즐거웠습니다.",
-        tags: ["친절해요", "차량이 깨끗해요"],
-      },
-      {
-        author: "정우진",
-        date: "2026. 11. 08.",
-        score: 4.8,
-        text: "모란역 승차 위치 안내를 미리 채팅으로 자세히 알려주셔서 찾기 쉬웠어요.",
-        tags: ["소통이 원활해요", "친절해요"],
-      },
-    ],
-  },
-  박민지: {
-    name: "박민지",
-    role: "rider",
-    emailVerified: true,
-    licenseVerified: false,
-    rating: 4.9,
-    tripCount: 16,
-    carInfo: "",
-    badges: ["매너 탑승자", "시간 엄수", "빠른 응답"],
-    reviews: [
-      {
-        author: "김도윤 운전자",
-        date: "2026. 11. 15.",
-        score: 5,
-        text: "약속 시간 5분 전에 미리 나와 계셔서 지체 없이 바로 출발할 수 있었습니다.",
-        tags: ["약속 시간을 잘 지켜요", "친절하고 매너가 좋아요"],
-      },
-      {
-        author: "최준호 운전자",
-        date: "2026. 11. 09.",
-        score: 5,
-        text: "채팅 응답이 빠르고 정산도 도착하자마자 바로 처리해 주셨어요.",
-        tags: ["소통이 원활해요", "탑승 규칙을 잘 지켜요"],
-      },
-    ],
-  },
-  이서연: {
-    name: "이서연",
-    role: "rider",
-    emailVerified: true,
-    licenseVerified: false,
-    rating: 4.8,
-    tripCount: 11,
-    carInfo: "",
-    badges: ["매너 탑승자", "시간 엄수", "친절한 소통"],
-    reviews: [
-      {
-        author: "김도윤 운전자",
-        date: "2026. 11. 12.",
-        score: 5,
-        text: "밝게 인사해주시고 탑승 매너가 아주 좋으신 학우님입니다.",
-        tags: ["친절하고 매너가 좋아요"],
-      },
-    ],
-  },
-  정우진: {
-    name: "정우진",
-    role: "rider",
-    emailVerified: true,
-    licenseVerified: false,
-    rating: 4.7,
-    tripCount: 7,
-    carInfo: "",
-    badges: ["시간 엄수", "빠른 응답"],
-    reviews: [
-      {
-        author: "김도윤 운전자",
-        date: "2026. 11. 08.",
-        score: 4.8,
-        text: "탑승 위치에서 정확히 대기해주셔서 원활하게 운행했습니다.",
-        tags: ["약속 시간을 잘 지켜요"],
-      },
-    ],
-  },
-  최준호: {
-    name: "최준호",
-    role: "driver",
-    emailVerified: true,
-    licenseVerified: true,
-    rating: 4.8,
-    tripCount: 19,
-    carInfo: "검정 기아 K3 · 34나 7890",
-    badges: ["안전운전", "시간 엄수", "친절한 드라이버"],
-    reviews: [
-      {
-        author: "박민지",
-        date: "2026. 11. 09.",
-        score: 5,
-        text: "급정거 없이 안전하게 운전해 주셔서 편안했습니다!",
-        tags: ["안전하게 운전해요", "시간을 잘 지켜요"],
-      },
-    ],
-  },
-}
+const DEMO_USER_PROFILES_DB: Record<string, Partial<PublicUserProfileData>> = {}
 
 function resolvePublicUserProfile(
   target: PublicUserProfileTarget | null,
@@ -883,18 +799,37 @@ function resolvePublicUserProfile(
     target.role || preset?.role || (target.carInfo ? "driver" : "rider")
 
   const isCurrentUser =
-    Boolean(currentAccount?.name) &&
-    currentAccount?.name.trim() === cleanName
+    (Boolean(currentAccount?.name) &&
+      currentAccount?.name.trim() === cleanName) ||
+    (Boolean(currentAccount?.id) && target.id === currentAccount?.id) ||
+    (Boolean(currentAccount?.loginId) && target.id === currentAccount?.loginId)
 
-  const flowRideForDriver = carpoolFlow?.rides?.find(
-    (item) => item?.driverName?.trim() === cleanName,
+  const flowRidesForDriver = (carpoolFlow?.rides || []).filter(
+    (item) =>
+      (item?.driverName?.trim() === cleanName ||
+        (target.id && item?.driverId === target.id)) &&
+      item.status === "완료",
+  )
+  const flowRideForDriver = (carpoolFlow?.rides || []).find(
+    (item) =>
+      item?.driverName?.trim() === cleanName ||
+      (target.id && item?.driverId === target.id),
+  )
+  const flowCompletedAppsForRider = (carpoolFlow?.applications || []).filter(
+    (app) =>
+      (app.riderName?.trim() === cleanName ||
+        (target.id && app.riderId === target.id)) &&
+      app.status === "완료",
   )
   const flowReviewsForDriver: DemoReview[] =
     resolvedRole === "driver" && carpoolFlow?.reviews
       ? carpoolFlow.reviews
           .filter((rev) => {
             const r = carpoolFlow.rides.find((item) => item.id === rev.rideId)
-            return r?.driverName?.trim() === cleanName
+            return (
+              r?.driverName?.trim() === cleanName ||
+              (target.id && rev.targetId === target.id)
+            )
           })
           .map((rev) => ({
             author: "탑승 학우",
@@ -911,38 +846,32 @@ function resolvePublicUserProfile(
       ? preset.reviews
       : []
 
-  const mergedReviews = isCurrentUser ? flowReviewsForDriver : [...flowReviewsForDriver, ...baseReviews]
-  const calculatedRating = isCurrentUser
-    ? flowReviewsForDriver.length > 0
+  const mergedReviews = isCurrentUser
+    ? flowReviewsForDriver
+    : [...flowReviewsForDriver, ...baseReviews]
+
+  const calculatedRating =
+    mergedReviews.length > 0
       ? Number(
           (
-            flowReviewsForDriver.reduce(
-              (acc, item) => acc + (Number(item?.score) || 5),
+            mergedReviews.reduce(
+              (acc, item) => acc + (Number(item?.score) || 0),
               0,
-            ) / flowReviewsForDriver.length
+            ) / mergedReviews.length
           ).toFixed(1),
         )
-      : 0.0
-    : typeof target.rating === "number" && Number.isFinite(target.rating) && target.rating > 0
-      ? target.rating
-      : typeof preset?.rating === "number" && Number.isFinite(preset.rating)
-        ? preset.rating
-        : mergedReviews.length > 0
-          ? Number(
-              (
-                mergedReviews.reduce(
-                  (acc, item) => acc + (Number(item?.score) || 5),
-                  0,
-                ) / mergedReviews.length
-              ).toFixed(1),
-            )
-          : 0.0
+      : typeof target.rating === "number" &&
+          Number.isFinite(target.rating) &&
+          target.rating > 0 &&
+          !isCurrentUser
+        ? target.rating
+        : 0.0
 
   const defaultBadges = isCurrentUser
-    ? (currentAccount?.isDriverVerified ? ["driver-license"] : [])
-    : resolvedRole === "driver"
-      ? ["친절한 드라이버", "시간 엄수", "안전운전"]
-      : ["매너 탑승자", "시간 엄수", "빠른 응답"]
+    ? currentAccount?.isDriverVerified
+      ? ["면허증 인증"]
+      : []
+    : []
 
   const badges = Array.isArray(target.badges)
     ? target.badges
@@ -959,13 +888,12 @@ function resolvePublicUserProfile(
     preset?.carInfo?.trim() ||
     ""
 
-  const tripCount = isCurrentUser
-    ? flowRidesForDriver.length
-    : typeof target.tripCount === "number" && Number.isFinite(target.tripCount)
+  const tripCount =
+    typeof target.tripCount === "number" && Number.isFinite(target.tripCount)
       ? target.tripCount
-      : typeof preset?.tripCount === "number"
-        ? preset.tripCount
-        : 0
+      : resolvedRole === "driver"
+        ? flowRidesForDriver.length
+        : flowCompletedAppsForRider.length
 
   return {
     id: target.id || `user-${cleanName}`,
@@ -975,7 +903,9 @@ function resolvePublicUserProfile(
     licenseVerified:
       resolvedRole === "driver"
         ? (target.licenseVerified ??
-          (isCurrentUser ? Boolean(currentAccount?.isDriverVerified ?? true) : true))
+          (isCurrentUser
+            ? Boolean(currentAccount?.isDriverVerified ?? true)
+            : true))
         : false,
     rating: calculatedRating,
     tripCount,
@@ -1214,6 +1144,7 @@ function CustomTimePickerModal({
   isOpen,
   value,
   arrivalValue,
+  initialField = "departure",
   minTime24,
   maxTime24,
   title = "시간 설정",
@@ -1225,6 +1156,7 @@ function CustomTimePickerModal({
   isOpen: boolean
   value: string
   arrivalValue?: string
+  initialField?: "departure" | "arrival"
   minTime24?: string
   maxTime24?: string
   title?: string
@@ -1235,7 +1167,7 @@ function CustomTimePickerModal({
 }) {
   const isDualMode = typeof onConfirmRange === "function"
   const [activeField, setActiveField] = useState<"departure" | "arrival">(
-    "departure",
+    initialField,
   )
   const [draftDeparture24, setDraftDeparture24] = useState(() =>
     minutesToTime24(Math.min(1438, toTotalMinutes24(value))),
@@ -1259,7 +1191,8 @@ function CustomTimePickerModal({
 
   useEffect(() => {
     if (!isOpen) return
-    setActiveField("departure")
+    const startField = isDualMode ? initialField : "departure"
+    setActiveField(startField)
     setAutoAdjustNotice("")
     setValidationAlertMessage("")
     if (isDualMode) {
@@ -1269,17 +1202,19 @@ function CustomTimePickerModal({
       )
       setDraftDeparture24(resolved.departure24)
       setDraftArrival24(resolved.arrival24)
-      const parsedDep = parseTime24(resolved.departure24)
-      setMeridiem(parsedDep.meridiem)
-      setHour12(parsedDep.hour12)
-      setMinute(parsedDep.minute)
+      const parsedTarget = parseTime24(
+        startField === "arrival" ? resolved.arrival24 : resolved.departure24,
+      )
+      setMeridiem(parsedTarget.meridiem)
+      setHour12(parsedTarget.hour12)
+      setMinute(parsedTarget.minute)
     } else {
       const parsed = parseTime24(value)
       setMeridiem(parsed.meridiem)
       setHour12(parsed.hour12)
       setMinute(parsed.minute)
     }
-  }, [arrivalValue, isDualMode, isOpen, value])
+  }, [arrivalValue, initialField, isDualMode, isOpen, value])
 
   if (!isOpen) return null
 
@@ -1713,41 +1648,7 @@ type StoredMemberRecord = {
   vehicleCapacity?: number
 }
 
-const DEFAULT_REGISTERED_USERS: StoredMemberRecord[] = [
-  {
-    id: "student",
-    loginId: "student",
-    email: "student@shingu.ac.kr",
-    password: "shingu1234!",
-    name: "박민지",
-    phone: "010-1234-5678",
-    gender: "선택 안 함",
-    role: "rider",
-  },
-  {
-    id: "minji",
-    loginId: "minji",
-    email: "minji@shingu.ac.kr",
-    password: "shingu1234!",
-    name: "박민지",
-    phone: "010-1234-5678",
-    gender: "선택 안 함",
-    role: "rider",
-  },
-  {
-    id: "driver",
-    loginId: "driver",
-    email: "driver@shingu.ac.kr",
-    password: "shingu1234!",
-    name: "김도윤",
-    phone: "010-9876-5432",
-    gender: "선택 안 함",
-    role: "driver",
-    isDriverVerified: true,
-    vehicleName: "현대 아반떼",
-    vehicleCapacity: 5,
-  },
-]
+const DEFAULT_REGISTERED_USERS: StoredMemberRecord[] = []
 
 function Auth({
   view,
@@ -1756,7 +1657,11 @@ function Auth({
 }: {
   view: AuthView
   setView: (view: AuthView) => void
-  onLogin: (role: Role, userProfile?: Partial<AccountData>) => void
+  onLogin: (
+    role: Role,
+    userProfile?: Partial<AccountData>,
+    isNewSignup?: boolean,
+  ) => void
 }) {
   const [showPassword, setShowPassword] = useState(false)
   const [step, setStep] = useState(1)
@@ -1776,6 +1681,8 @@ function Auth({
   const [signupPassword, setSignupPassword] = useState("")
   const [passwordConfirm, setPasswordConfirm] = useState("")
   const [phone, setPhone] = useState("")
+  const [signupGender, setSignupGender] = useState("")
+  const [signupTermsAgreed, setSignupTermsAgreed] = useState(true)
   const [driverLicenseSelected, setDriverLicenseSelected] = useState(false)
   const [driverLicenseFileName, setDriverLicenseFileName] = useState("")
   const [driverLicenseFileSize, setDriverLicenseFileSize] = useState("")
@@ -1788,13 +1695,10 @@ function Auth({
   const [loginPassword, setLoginPassword] = useState("")
   const [resetId, setResetId] = useState("")
   const [resetEmail, setResetEmail] = useState("")
-  const [resetCodeSent, setResetCodeSent] = useState(false)
-  const [resetIssuedCode, setResetIssuedCode] = useState("")
-  const [resetCodeInput, setResetCodeInput] = useState("")
   const [resetVerified, setResetVerified] = useState(false)
-  const [resetVerifying, setResetVerifying] = useState(false)
+  const [resetNewPassword, setResetNewPassword] = useState("")
+  const [resetNewPasswordConfirm, setResetNewPasswordConfirm] = useState("")
   const [resetInlineError, setResetInlineError] = useState("")
-  const [resetNotice, setResetNotice] = useState("")
   const [foundMember, setFoundMember] = useState<StoredMemberRecord | null>(null)
   const [resetModal, setResetModal] = useState<{
     type: "error" | "password"
@@ -2100,15 +2004,109 @@ function Auth({
   }
 
   const handleSignupComplete = async () => {
+    if (!signupEmail.trim()) {
+      setStep(1)
+      await showAppAlert({
+        title: "이메일 미입력",
+        message: "학교 이메일 주소를 입력해주세요.",
+      })
+      return
+    }
     if (!verified) {
       setStep(1)
       setEmailError("학교 이메일 인증을 먼저 완료해 주세요.")
+      await showAppAlert({
+        title: "이메일 인증 필요",
+        message: "학교 이메일 인증을 먼저 완료해 주세요.",
+      })
       return
     }
-    if (!signupId.trim() || !signupPassword.trim()) {
+    if (!signupName.trim()) {
+      setStep(3)
       await showAppAlert({
-        title: "입력 확인",
-        message: "아이디와 비밀번호를 입력해 주세요.",
+        title: "이름 미입력",
+        message: "이름을 입력해주세요.",
+      })
+      return
+    }
+    if (!signupId.trim()) {
+      setStep(3)
+      await showAppAlert({
+        title: "아이디 미입력",
+        message: "아이디를 입력해주세요.",
+      })
+      return
+    }
+    if (signupId.trim().length < 4) {
+      setStep(3)
+      await showAppAlert({
+        title: "아이디 확인",
+        message: "아이디는 4자 이상 입력해 주세요.",
+      })
+      return
+    }
+    if (!signupPassword.trim()) {
+      setStep(3)
+      await showAppAlert({
+        title: "비밀번호 미입력",
+        message: "비밀번호를 입력해주세요.",
+      })
+      return
+    }
+    if (signupPassword.trim().length < 6) {
+      setStep(3)
+      await showAppAlert({
+        title: "비밀번호 확인",
+        message: "비밀번호는 6자 이상 입력해 주세요.",
+      })
+      return
+    }
+    if (!passwordConfirm.trim()) {
+      setStep(3)
+      await showAppAlert({
+        title: "비밀번호 확인 미입력",
+        message: "비밀번호 확인란을 입력해주세요.",
+      })
+      return
+    }
+    if (signupPassword !== passwordConfirm) {
+      setStep(3)
+      await showAppAlert({
+        title: "비밀번호 불일치",
+        message: "비밀번호가 일치하지 않습니다.",
+      })
+      return
+    }
+    const cleanPhone = phone.trim()
+    if (!cleanPhone) {
+      setStep(3)
+      await showAppAlert({
+        title: "전화번호 미입력",
+        message: "전화번호를 입력해주세요.",
+      })
+      return
+    }
+    if (!isValidPhoneNumber(cleanPhone)) {
+      setStep(3)
+      await showAppAlert({
+        title: "전화번호 형식 확인",
+        message: "휴대폰 번호 11자리를 올바르게 입력해 주세요. (예: 010-1234-5678)",
+      })
+      return
+    }
+    if (!signupGender.trim() || signupGender === "선택하지 않음") {
+      setStep(3)
+      await showAppAlert({
+        title: "성별 미선택",
+        message: "성별을 선택해주세요.",
+      })
+      return
+    }
+    if (!signupTermsAgreed) {
+      setStep(3)
+      await showAppAlert({
+        title: "약관 동의 필요",
+        message: "필수 약관 및 개인정보 처리방침에 동의해 주세요.",
       })
       return
     }
@@ -2127,7 +2125,7 @@ function Auth({
         setStep(4)
         await showAppAlert({
           title: "차종 입력 확인",
-          message: "차종을 입력해 주세요. (예: 아반떼, K5, 모닝 등)",
+          message: "차종을 입력해 주세요. (예: 아반떼)",
         })
         return
       }
@@ -2139,8 +2137,8 @@ function Auth({
         })
         return
       }
-      const capNum = Number(vehicleCapacity)
-      if (!Number.isInteger(capNum) || capNum <= 0) {
+      const capNum = Number(vehicleCapacity.trim())
+      if (!vehicleCapacity.trim() || !Number.isInteger(capNum) || capNum <= 0) {
         setStep(4)
         await showAppAlert({
           title: "차량 정원 확인",
@@ -2148,15 +2146,6 @@ function Auth({
         })
         return
       }
-    }
-    const cleanPhone = phone.trim()
-    if (!cleanPhone || !isValidPhoneNumber(cleanPhone)) {
-      setStep(2)
-      await showAppAlert({
-        title: "전화번호 확인",
-        message: "올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
-      })
-      return
     }
     const normalizedPhone = normalizePhoneNumber(cleanPhone)
 
@@ -2167,13 +2156,14 @@ function Auth({
       (cleanSignupId.includes("@") ? cleanSignupId : `${cleanSignupId}@shingu.ac.kr`)
     const isDriverVerified = role === "driver" && driverLicenseSelected
     const profilePayload: Partial<AccountData> = {
-      name: signupName.trim() || email.split("@")[0] || "신규 회원",
+      name: signupName.trim(),
       email,
       id: cleanSignupId,
       loginId: cleanSignupId,
       password: signupPassword,
       phone: normalizedPhone,
-      gender: "선택 안 함",
+      gender: signupGender.trim(),
+      role,
       isDriverVerified,
       licenseFileName: isDriverVerified ? driverLicenseFileName : undefined,
       vehicleName: role === "driver" ? vehicleName.trim() : undefined,
@@ -2184,9 +2174,9 @@ function Auth({
       loginId: cleanSignupId,
       email,
       password: signupPassword,
-      name: profilePayload.name || "신규 회원",
+      name: signupName.trim(),
       phone: normalizedPhone,
-      gender: "선택 안 함",
+      gender: signupGender.trim(),
       role,
       isDriverVerified,
       licenseFileName: isDriverVerified ? driverLicenseFileName : undefined,
@@ -2204,16 +2194,19 @@ function Auth({
     try {
       if (isSupabaseConfigured()) {
         try {
-          await supabaseSignUp(email, signupPassword, {
-            name: profilePayload.name || "신규 회원",
+          const signUpRes = await supabaseSignUp(email, signupPassword, {
+            name: signupName.trim(),
             phone: normalizedPhone,
-            gender: "선택 안 함",
+            gender: signupGender.trim(),
             role,
             isDriverVerified,
             licenseFileName: driverLicenseFileName,
             vehicleName: vehicleName.trim(),
             vehicleCapacity: Number(vehicleCapacity) || 5,
           })
+          if (signUpRes?.user?.id) {
+            profilePayload.id = signUpRes.user.id
+          }
         } catch (supabaseErr) {
           console.warn("Supabase 회원가입 폴백 처리:", supabaseErr)
         }
@@ -2223,7 +2216,7 @@ function Auth({
         message: "회원가입이 완료되었습니다!",
         variant: "success",
       })
-      onLogin(role, profilePayload)
+      onLogin(role, profilePayload, true)
     } catch (err) {
       await showAppAlert({
         title: "회원가입 실패",
@@ -2241,13 +2234,12 @@ function Auth({
     setResetInlineError("")
     if (!trimmedId || !trimmedEmail) {
       const msg = !trimmedId && !trimmedEmail
-        ? "아이디와 학교 이메일을 모두 입력해 주세요."
+        ? "아이디와 신구대학교 이메일을 모두 입력해 주세요."
         : !trimmedId
           ? "아이디를 입력해 주세요."
-          : "학교 이메일을 입력해 주세요."
+          : "신구대학교 이메일을 입력해 주세요."
       setResetInlineError(msg)
-      setResetModal({
-        type: "error",
+      await showAppAlert({
         title: "입력 정보를 확인해 주세요",
         message: msg,
       })
@@ -2261,139 +2253,129 @@ function Auth({
         member.loginId.toLowerCase() === trimmedId.toLowerCase() ||
         member.id.toLowerCase() === trimmedId.toLowerCase() ||
         emailPrefix === trimmedId.toLowerCase()
-      return emailMatch && idMatch
+      return emailMatch || idMatch
     })
-    if (!matched) {
-      setResetCodeSent(false)
-      setResetVerified(false)
-      setFoundMember(null)
-      setResetInlineError("입력하신 아이디와 학교 이메일 정보가 일치하는 계정이 없습니다.")
-      setResetModal({
-        type: "error",
-        title: "회원 정보 불일치",
-        message:
-          "입력하신 아이디와 학교 이메일이 기존 회원 데이터와 일치하지 않습니다. 가입하신 정보를 다시 확인해 주세요.",
-      })
-      return
+    const resolvedMember: StoredMemberRecord = matched || {
+      id: trimmedId,
+      loginId: trimmedId,
+      email: trimmedEmail,
+      password: "shingu1234!",
+      name: trimmedId,
+      role: "rider",
     }
-
-    setAuthLoading(true)
-    try {
-      const otpResult = await supabaseSendSchoolEmailOtp(trimmedEmail)
-      const code = otpResult.fallbackCode
-      setFoundMember(matched)
-      setResetIssuedCode(code)
-      setResetCodeSent(true)
-      setResetVerified(false)
-      setResetCodeInput("")
-      setResetInlineError("")
-      setResetNotice(
-        `${trimmedEmail}로 본인 확인용 인증번호가 발송되었습니다. (인증번호: ${code})`,
-      )
-    } catch {
-      const fallback = String(Math.floor(100000 + Math.random() * 900000))
-      setFoundMember(matched)
-      setResetIssuedCode(fallback)
-      setResetCodeSent(true)
-      setResetVerified(false)
-      setResetCodeInput("")
-      setResetInlineError("")
-      setResetNotice(
-        `${trimmedEmail}로 본인 확인용 인증번호가 발송되었습니다. (인증번호: ${fallback})`,
-      )
-    } finally {
-      setAuthLoading(false)
-    }
-  }
-
-  const handleVerifyResetCode = async () => {
-    if (!resetCodeSent || !foundMember) {
-      const msg = "먼저 아이디와 학교 이메일을 입력하고 '인증번호 받기'를 진행해 주세요."
-      setResetInlineError(msg)
-      setResetModal({
-        type: "error",
-        title: "인증번호 요청 필요",
-        message: msg,
-      })
-      return
-    }
-    const trimmedCode = resetCodeInput.trim()
-    if (!trimmedCode) {
-      const msg = "발송된 인증번호를 입력해 주세요."
-      setResetInlineError(msg)
-      setResetModal({
-        type: "error",
-        title: "인증번호 미입력",
-        message: msg,
-      })
-      return
-    }
-    setResetVerifying(true)
+    // 이메일 인증번호 단계를 거치지 않고 즉시 데모 모드로 다음 단계 진행
+    setFoundMember(resolvedMember)
+    setResetVerified(true)
     setResetInlineError("")
-    try {
-      const serverVerified = await supabaseVerifySchoolEmailOtp(
-        foundMember.email,
-        trimmedCode,
-        resetIssuedCode,
-      )
-      const isCodeMatch =
-        serverVerified ||
-        (Boolean(resetIssuedCode) && trimmedCode === resetIssuedCode) ||
-        trimmedCode === "0624"
-      if (!isCodeMatch) {
-        setResetVerified(false)
-        const msg = "인증번호가 일치하지 않습니다. 발송된 인증번호를 다시 확인해 주세요."
-        setResetInlineError(msg)
-        setResetModal({
-          type: "error",
-          title: "인증번호 불일치",
-          message: msg,
-        })
-        return
-      }
-      setResetVerified(true)
-      setResetInlineError("")
-      setResetModal({
-        type: "password",
-        title: "본인 확인 및 비밀번호 안내",
-        message: `${foundMember.name || foundMember.loginId}님의 본인 인증이 완료되었습니다. 기존 비밀번호를 확인해 주세요.`,
-        password: foundMember.password || "shingu1234!",
-        loginId: foundMember.loginId,
-        email: foundMember.email,
-      })
-    } catch {
-      const msg = "인증번호 검증 중 오류가 발생했습니다. 다시 시도해 주세요."
-      setResetInlineError(msg)
-      setResetModal({
-        type: "error",
-        title: "인증 오류",
-        message: msg,
-      })
-    } finally {
-      setResetVerifying(false)
-    }
   }
-  const totalSignupSteps = role === "driver" ? 4 : 3
-  const isVehicleValid =
-    vehicleName.trim().length > 0 &&
-    /^[a-zA-Z0-9가-힣\s\-]+$/.test(vehicleName.trim())
 
-  const driverInfoValid =
-    driverLicenseSelected &&
-    isVehicleValid &&
-    Number.isInteger(Number(vehicleCapacity)) &&
-    Number(vehicleCapacity) > 0
+  const handleSaveResetNewPassword = async () => {
+    if (!foundMember) return
+    const nextPw = resetNewPassword.trim()
+    const nextPwConfirm = resetNewPasswordConfirm.trim()
+    if (!nextPw) {
+      await showAppAlert({
+        title: "비밀번호 미입력",
+        message: "새 비밀번호를 입력해 주세요.",
+      })
+      return
+    }
+    if (nextPw.length < 6) {
+      await showAppAlert({
+        title: "비밀번호 확인",
+        message: "비밀번호는 6자 이상 입력해 주세요.",
+      })
+      return
+    }
+    if (!nextPwConfirm) {
+      await showAppAlert({
+        title: "비밀번호 확인 미입력",
+        message: "새 비밀번호 확인란을 입력해 주세요.",
+      })
+      return
+    }
+    if (nextPw !== nextPwConfirm) {
+      await showAppAlert({
+        title: "비밀번호 불일치",
+        message: "새 비밀번호가 일치하지 않습니다.",
+      })
+      return
+    }
+    const updatedMember: StoredMemberRecord = {
+      ...foundMember,
+      password: nextPw,
+    }
+    upsertRegisteredMember(updatedMember)
+    setFoundMember(updatedMember)
+    const savedAccount = readDemoData<AccountData>("account", defaultAccount)
+    if (
+      savedAccount &&
+      (savedAccount.loginId === foundMember.loginId ||
+        savedAccount.email === foundMember.email)
+    ) {
+      writeDemoData("account", { ...savedAccount, password: nextPw })
+    }
+    await showAppAlert({
+      title: "비밀번호 변경 완료",
+      message: "새 비밀번호가 설정되었습니다. 변경된 비밀번호로 로그인해 주세요.",
+      variant: "success",
+    })
+    setLoginId(foundMember.loginId)
+    setResetNewPassword("")
+    setResetNewPasswordConfirm("")
+    setResetVerified(false)
+    setView("login")
+  }
+
+  const totalSignupSteps = role === "driver" ? 4 : 3
 
   const handleNextSignupStep = async () => {
     if (step === 1) {
+      if (!signupEmail.trim()) {
+        setEmailError("학교 이메일 주소를 입력해 주세요.")
+        await showAppAlert({
+          title: "이메일 미입력",
+          message: "학교 이메일 주소를 입력해주세요.",
+        })
+        return
+      }
       if (!verified) {
         setEmailError("학교 이메일 인증을 완료해야 다음 단계로 이동할 수 있습니다.")
+        await showAppAlert({
+          title: "이메일 인증 필요",
+          message: "학교 이메일 인증을 완료해야 다음 단계로 이동할 수 있습니다.",
+        })
         return
       }
       setStep(2)
       return
     }
     if (step === 2) {
+      if (!role) {
+        await showAppAlert({
+          title: "역할 선택 확인",
+          message: "이용하실 역할(운전자 또는 탑승자)을 선택해주세요.",
+        })
+        return
+      }
+      setStep(3)
+      return
+    }
+    if (step === 3) {
+      if (!signupName.trim()) {
+        await showAppAlert({
+          title: "이름 미입력",
+          message: "이름을 입력해주세요.",
+        })
+        return
+      }
+      if (!signupId.trim()) {
+        await showAppAlert({
+          title: "아이디 미입력",
+          message: "아이디를 입력해주세요.",
+        })
+        return
+      }
       if (signupId.trim().length < 4) {
         await showAppAlert({
           title: "아이디 확인",
@@ -2401,10 +2383,24 @@ function Auth({
         })
         return
       }
+      if (!signupPassword.trim()) {
+        await showAppAlert({
+          title: "비밀번호 미입력",
+          message: "비밀번호를 입력해주세요.",
+        })
+        return
+      }
       if (signupPassword.trim().length < 6) {
         await showAppAlert({
           title: "비밀번호 확인",
           message: "비밀번호는 6자 이상 입력해 주세요.",
+        })
+        return
+      }
+      if (!passwordConfirm.trim()) {
+        await showAppAlert({
+          title: "비밀번호 확인 미입력",
+          message: "비밀번호 확인란을 입력해주세요.",
         })
         return
       }
@@ -2418,19 +2414,37 @@ function Auth({
       const cleanPhone = phone.trim()
       if (!cleanPhone) {
         await showAppAlert({
-          title: "전화번호 확인",
-          message: "전화번호를 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+          title: "전화번호 미입력",
+          message: "전화번호를 입력해주세요.",
         })
         return
       }
       if (!isValidPhoneNumber(cleanPhone)) {
         await showAppAlert({
           title: "전화번호 형식 확인",
-          message: "올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)",
+          message: "휴대폰 번호 11자리를 올바르게 입력해 주세요. (예: 010-1234-5678)",
         })
         return
       }
-      setStep(3)
+      if (!signupGender.trim() || signupGender === "선택하지 않음") {
+        await showAppAlert({
+          title: "성별 미선택",
+          message: "성별을 선택해주세요.",
+        })
+        return
+      }
+      if (!signupTermsAgreed) {
+        await showAppAlert({
+          title: "약관 동의 필요",
+          message: "필수 약관 및 개인정보 처리방침에 동의해 주세요.",
+        })
+        return
+      }
+      if (role === "driver") {
+        setStep(4)
+        return
+      }
+      await handleSignupComplete()
       return
     }
     if (step === 4 && role === "driver") {
@@ -2446,7 +2460,7 @@ function Auth({
       if (!trimmedVehicle) {
         await showAppAlert({
           title: "차종 입력 확인",
-          message: "차종을 입력해 주세요. (예: 아반떼, K5, 모닝 등)",
+          message: "차종을 입력해 주세요. (예: 아반떼)",
         })
         return
       }
@@ -2457,20 +2471,17 @@ function Auth({
         })
         return
       }
-      const capNum = Number(vehicleCapacity)
-      if (!Number.isInteger(capNum) || capNum <= 0) {
+      const capNum = Number(vehicleCapacity.trim())
+      if (!vehicleCapacity.trim() || !Number.isInteger(capNum) || capNum <= 0) {
         await showAppAlert({
           title: "차량 정원 확인",
           message: "차량 정원을 1명 이상 숫자로 입력해 주세요.",
         })
         return
       }
-    }
-    if (step < totalSignupSteps) {
-      setStep(step + 1)
+      await handleSignupComplete()
       return
     }
-    await handleSignupComplete()
   }
 
   if (view === "reset") {
@@ -2479,6 +2490,11 @@ function Auth({
         <button
           className="icon-button auth__back"
           onClick={() => {
+            if (resetVerified) {
+              setResetVerified(false)
+              setFoundMember(null)
+              return
+            }
             setResetModal(null)
             setView("login")
           }}
@@ -2487,178 +2503,108 @@ function Auth({
           <ArrowLeft />
         </button>
         <div className="auth__header">
-          <span className="eyebrow">계정 찾기</span>
-          <h1>비밀번호 확인</h1>
-          <p>가입한 아이디와 신구대학교 이메일로 본인을 확인해 주세요.</p>
+          <span className="eyebrow">계정 찾기 · 데모 모드</span>
+          <h1>{resetVerified ? "비밀번호 확인 및 재설정" : "비밀번호 찾기"}</h1>
+          <p>
+            {resetVerified
+              ? "확인된 계정의 기존 비밀번호를 확인하거나 새 비밀번호를 설정할 수 있습니다."
+              : "가입한 아이디와 신구대학교 이메일을 입력하면 바로 다음 단계로 진행됩니다."}
+          </p>
         </div>
-        <div className="form-stack">
-          <Field
-            label="아이디"
-            placeholder="가입한 아이디 입력"
-            value={resetId}
-            onChange={(event) => {
-              setResetId(event.target.value)
-              setResetCodeSent(false)
-              setResetVerified(false)
-              setFoundMember(null)
-              setResetInlineError("")
-              setResetNotice("")
-            }}
-          />
-          <Field
-            label="학교 이메일"
-            type="email"
-            placeholder="student@shingu.ac.kr"
-            value={resetEmail}
-            onChange={(event) => {
-              setResetEmail(event.target.value)
-              setResetCodeSent(false)
-              setResetVerified(false)
-              setFoundMember(null)
-              setResetInlineError("")
-              setResetNotice("")
-            }}
-          />
-          <Button
-            type="button"
-            onClick={() => void handleResetPassword()}
-            disabled={authLoading}
-          >
-            {authLoading
-              ? "확인 중..."
-              : resetCodeSent
-                ? "인증번호 재발송"
-                : "인증번호 받기"}
-          </Button>
-          {resetInlineError && (
-            <span className="field-error">{resetInlineError}</span>
-          )}
-          {resetCodeSent && (
-            <div className="reset-verify-reveal">
-              {resetNotice && (
-                <div className="email-code-notice">
+        {!resetVerified ? (
+          <div className="form-stack">
+            <Field
+              label="아이디"
+              placeholder="가입한 아이디 입력"
+              value={resetId}
+              onChange={(event) => {
+                setResetId(event.target.value)
+                setResetVerified(false)
+                setFoundMember(null)
+                setResetInlineError("")
+              }}
+            />
+            <Field
+              label="신구대학교 이메일"
+              type="email"
+              placeholder="student@shingu.ac.kr"
+              value={resetEmail}
+              onChange={(event) => {
+                setResetEmail(event.target.value)
+                setResetVerified(false)
+                setFoundMember(null)
+                setResetInlineError("")
+              }}
+            />
+            {resetInlineError && (
+              <span className="field-error">{resetInlineError}</span>
+            )}
+            <Button
+              type="button"
+              onClick={() => void handleResetPassword()}
+              disabled={authLoading}
+            >
+              {authLoading ? "확인 중..." : "다음 (비밀번호 확인)"}
+            </Button>
+            <p className="helper">
+              데모 모드에서는 이메일 인증번호 입력 단계 없이 즉시 비밀번호 확인 및 재설정 화면으로 이동합니다.
+            </p>
+          </div>
+        ) : (
+          foundMember && (
+            <div className="form-stack">
+              <section className="reset-password-card" aria-live="polite">
+                <div className="reset-password-card__head">
                   <ShieldCheck />
-                  <span>{resetNotice}</span>
+                  <div>
+                    <strong>계정 확인 완료 · 기존 비밀번호 안내</strong>
+                    <small>
+                      {foundMember.loginId} ({foundMember.email})
+                    </small>
+                  </div>
                 </div>
-              )}
-              <div className="inline-action inline-action--verify">
-                <Field
-                  label="인증번호 입력"
-                  placeholder="인증번호 6자리 입력"
-                  value={resetCodeInput}
-                  maxLength={6}
-                  disabled={resetVerified}
-                  onChange={(event) => {
-                    setResetCodeInput(event.target.value)
-                    setResetInlineError("")
-                  }}
-                />
+                <div className="reset-password-card__body">
+                  <span>기존 비밀번호</span>
+                  <code>{foundMember.password || "shingu1234!"}</code>
+                </div>
+              </section>
+              <Field
+                label="새 비밀번호 설정 (선택)"
+                type="password"
+                placeholder="변경할 새 비밀번호 (6자 이상)"
+                value={resetNewPassword}
+                onChange={(event) => setResetNewPassword(event.target.value)}
+              />
+              <Field
+                label="새 비밀번호 확인"
+                type="password"
+                placeholder="새 비밀번호 다시 입력"
+                value={resetNewPasswordConfirm}
+                onChange={(event) =>
+                  setResetNewPasswordConfirm(event.target.value)
+                }
+              />
+              {resetNewPassword.trim() ? (
                 <Button
                   type="button"
-                  variant={resetVerified ? "soft" : "secondary"}
-                  disabled={resetVerifying || resetVerified}
-                  onClick={() => void handleVerifyResetCode()}
+                  onClick={() => void handleSaveResetNewPassword()}
                 >
-                  {resetVerifying
-                    ? "검증 중..."
-                    : resetVerified
-                      ? "인증완료"
-                      : "입력완료"}
+                  새 비밀번호 저장하고 로그인하기
                 </Button>
-              </div>
-            </div>
-          )}
-          {resetVerified && foundMember && (
-            <section className="reset-password-card" aria-live="polite">
-              <div className="reset-password-card__head">
-                <ShieldCheck />
-                <div>
-                  <strong>본인 확인 완료 · 기존 비밀번호 안내</strong>
-                  <small>
-                    {foundMember.loginId} ({foundMember.email})
-                  </small>
-                </div>
-              </div>
-              <div className="reset-password-card__body">
-                <span>기존 비밀번호</span>
-                <code>{foundMember.password || "shingu1234!"}</code>
-              </div>
+              ) : null}
               <Button
                 type="button"
                 variant="secondary"
                 onClick={() => {
                   setLoginId(foundMember.loginId)
+                  setResetVerified(false)
                   setView("login")
                 }}
               >
-                이 계정으로 로그인하러 가기
+                이 계정으로 바로 로그인하러 가기
               </Button>
-            </section>
-          )}
-          <p className="helper">
-            가입된 아이디와 학교 이메일이 일치하면 인증번호 확인 후 기존 비밀번호를 확인하실 수 있습니다.
-          </p>
-        </div>
-        {resetModal && (
-          <div
-            className="dialog-backdrop flow-dialog-backdrop"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget) setResetModal(null)
-            }}
-          >
-            <section className="app-dialog" role="alertdialog" aria-modal="true">
-              <span
-                className={`dialog-icon ${
-                  resetModal.type === "error" ? "neutral" : ""
-                }`}
-              >
-                {resetModal.type === "error" ? <CircleHelp /> : <ShieldCheck />}
-              </span>
-              <h2>{resetModal.title}</h2>
-              <p>{resetModal.message}</p>
-              {resetModal.type === "password" && (
-                <div className="reset-modal-password-box">
-                  <div>
-                    <span>아이디</span>
-                    <strong>{resetModal.loginId}</strong>
-                  </div>
-                  <div>
-                    <span>학교 이메일</span>
-                    <strong>{resetModal.email}</strong>
-                  </div>
-                  <div className="reset-modal-password-highlight">
-                    <span>기존 비밀번호</span>
-                    <code>{resetModal.password}</code>
-                  </div>
-                </div>
-              )}
-              <div
-                className={
-                  resetModal.type === "password" ? "dialog-actions" : ""
-                }
-              >
-                <Button
-                  type="button"
-                  variant={resetModal.type === "password" ? "soft" : "primary"}
-                  onClick={() => setResetModal(null)}
-                >
-                  확인
-                </Button>
-                {resetModal.type === "password" && (
-                  <Button
-                    type="button"
-                    onClick={() => {
-                      if (resetModal.loginId) setLoginId(resetModal.loginId)
-                      setResetModal(null)
-                      setView("login")
-                    }}
-                  >
-                    로그인하기
-                  </Button>
-                )}
-              </div>
-            </section>
-          </div>
+            </div>
+          )
         )}
       </main>
     )
@@ -2877,34 +2823,46 @@ function Auth({
                 </span>
               )}
               <Field
-                label="전화번호"
+                label="전화번호 *"
                 type="tel"
-                placeholder="예: 01012345678 ('-' 없이 숫자만 입력)"
+                inputMode="numeric"
+                placeholder="숫자만 입력 (자동 하이픈 입력)"
                 maxLength={13}
                 value={phone}
                 onChange={(event) => {
-                  const cleaned = event.target.value.replace(/[^0-9-]/g, "").slice(0, 13)
-                  setPhone(cleaned)
+                  const formatted = formatPhoneInput(event.target.value, phone)
+                  setPhone(formatted)
                 }}
               />
-              {phone && !isValidPhoneNumber(phone) && (
-                <span className="field-error">
-                  올바른 휴대폰 번호 형식을 입력해 주세요. (예: 01012345678 또는 010-1234-5678)
+              {!isValidPhoneNumber(phone) && (
+                <span className={phone ? "field-error" : "helper"}>
+                  {phone
+                    ? "전화번호 11자리를 모두 입력해 주세요. (010-0000-0000)"
+                    : "숫자만 입력하면 하이픈(-)이 자동으로 입력됩니다."}
                 </span>
               )}
               <label className="field">
-                <span>성별 · 선택 사항 · 기본 비공개</span>
-                <select defaultValue="">
+                <span>성별 *</span>
+                <select
+                  value={signupGender}
+                  onChange={(event) => setSignupGender(event.target.value)}
+                >
                   <option value="">선택하지 않음</option>
-                  <option value="female">여성</option>
-                  <option value="male">남성</option>
-                  <option value="private">비공개</option>
+                  <option value="여성">여성</option>
+                  <option value="남성">남성</option>
+                  <option value="비공개">비공개</option>
                 </select>
               </label>
               <label className="check-row">
-                <input type="checkbox" defaultChecked />
-                <span>
-                  <Check />
+                <input
+                  type="checkbox"
+                  checked={signupTermsAgreed}
+                  onChange={(event) =>
+                    setSignupTermsAgreed(event.target.checked)
+                  }
+                />
+                <span className={signupTermsAgreed ? "checked" : ""}>
+                  {signupTermsAgreed && <Check />}
                 </span>{" "}
                 필수 약관 및 개인정보 처리방침에 동의합니다.
               </label>
@@ -2994,12 +2952,8 @@ function Auth({
         )}
         <div className="signup-footer">
           <Button
-            disabled={
-              authLoading ||
-              (step === 1 && !verified) ||
-              (step === 4 && !driverLicenseSelected)
-            }
-            onClick={handleNextSignupStep}
+            disabled={authLoading}
+            onClick={() => void handleNextSignupStep()}
           >
             {authLoading
               ? "처리 중..."
@@ -3023,7 +2977,7 @@ function Auth({
 
   const performBiometricAutoLogin = () => {
     const savedBio = getBiometricAccount()
-    if (savedBio?.account?.email) {
+    if (savedBio?.account?.email || savedBio?.account?.name) {
       onLogin(savedBio.role || "rider", savedBio.account)
       return
     }
@@ -3033,14 +2987,9 @@ function Auth({
       onLogin(savedRole, storedAccount)
       return
     }
-    const fallbackUser = DEFAULT_REGISTERED_USERS[0]
-    onLogin(fallbackUser.role || "rider", {
-      id: fallbackUser.id,
-      loginId: fallbackUser.loginId,
-      email: fallbackUser.email,
-      name: fallbackUser.name,
-      phone: fallbackUser.phone || "010-1234-5678",
-      gender: fallbackUser.gender || "선택 안 함",
+    void showAppAlert({
+      title: "등록된 생체인증 계정 없음",
+      message: "먼저 로그인 또는 회원가입 후 보안 설정에서 생체인증을 등록해 주세요.",
     })
   }
 
@@ -3204,9 +3153,11 @@ function Header({
 function RouteCard({
   small = false,
   route = defaultRoutes.rider,
+  onOpenTimePicker,
 }: {
   small?: boolean
   route?: RouteData
+  onOpenTimePicker?: (field?: "departure" | "arrival") => void
 }) {
   const syncExtracted = useMemo(
     () =>
@@ -3268,6 +3219,10 @@ function RouteCard({
       ? safeWaypoints.join(" · ")
       : DIRECT_ROUTE_LABEL
 
+  const arrivalTimeDisplay =
+    route?.preferredArrival ||
+    addMinutesToTime24(route?.departureTime || "08:30", 30)
+
   return (
     <div className={`route-card ${small ? "route-card--small" : ""}`}>
       <div className="route-line">
@@ -3277,7 +3232,21 @@ function RouteCard({
       </div>
       <div className="route-copy">
         <div>
-          <span>출발 · {route?.departureTime || "08:30"}</span>
+          {onOpenTimePicker ? (
+            <button
+              type="button"
+              className="route-time-inline-btn"
+              onClick={(event) => {
+                event.stopPropagation()
+                onOpenTimePicker("departure")
+              }}
+              aria-label="출발 시간 간편 변경"
+            >
+              <Clock3 /> 출발 · {route?.departureTime || "08:30"} (시간 변경)
+            </button>
+          ) : (
+            <span>출발 · {route?.departureTime || "08:30"}</span>
+          )}
           <strong>{route?.start || "출발지 미설정"}</strong>
         </div>
         {hasValidEndpoints && (
@@ -3286,10 +3255,24 @@ function RouteCard({
           </div>
         )}
         <div>
-          <span>
-            도착
-            {route?.preferredArrival ? ` · ${route.preferredArrival}` : ""}
-          </span>
+          {onOpenTimePicker ? (
+            <button
+              type="button"
+              className="route-time-inline-btn"
+              onClick={(event) => {
+                event.stopPropagation()
+                onOpenTimePicker("arrival")
+              }}
+              aria-label="희망 도착 시간 간편 변경"
+            >
+              <Clock3 /> 희망 도착 · {arrivalTimeDisplay} (시간 변경)
+            </button>
+          ) : (
+            <span>
+              도착
+              {route?.preferredArrival ? ` · ${route.preferredArrival}` : ""}
+            </span>
+          )}
           <strong>{route?.destination || "목적지 미설정"}</strong>
         </div>
       </div>
@@ -3315,7 +3298,7 @@ function RiderHome({
   route: RouteData
   bookingDate: string
   onOpenDatePicker: () => void
-  onOpenTimePicker: () => void
+  onOpenTimePicker: (field?: "departure" | "arrival") => void
   tripFlow: DemoTripFlow
   carpoolFlow: DemoCarpoolState
   onOpenChat: (rideId: string) => void
@@ -3329,15 +3312,20 @@ function RiderHome({
     [route, carpoolFlow],
   )
   const myRiderId = (account?.id || account?.loginId || "").trim()
-  const riderApplications = carpoolFlow.applications.filter((item) =>
-    myRiderId
-      ? item.riderId === myRiderId ||
-        item.riderId === account?.id ||
-        item.riderId === account?.loginId
-      : item.riderId === "demo-rider",
+  const riderApplications = useMemo(
+    () =>
+      myRiderId
+        ? (carpoolFlow.applications || []).filter(
+            (item) =>
+              item.riderId === myRiderId ||
+              item.riderId === account?.id ||
+              item.riderId === account?.loginId,
+          )
+        : [],
+    [account?.id, account?.loginId, carpoolFlow.applications, myRiderId],
   )
   const latestApplication = riderApplications[0]
-  const latestApplicationRide = carpoolFlow.rides.find(
+  const latestApplicationRide = (carpoolFlow.rides || []).find(
     (item) => item.id === latestApplication?.rideId,
   )
   const moveRide = (nextIndex: number) => {
@@ -3352,6 +3340,9 @@ function RiderHome({
   }
 
   const driverDisplayName = latestApplicationRide?.driverName || "운전자"
+  const arrivalTimeLabel =
+    route.preferredArrival ||
+    addMinutesToTime24(route.departureTime || "08:30", 30)
 
   return (
     <div className="page">
@@ -3372,11 +3363,19 @@ function RiderHome({
             기본 경로 수정
           </button>
         </div>
-        <RouteCard small route={route} />
+        <RouteCard
+          small
+          route={route}
+          onOpenTimePicker={(field) => onOpenTimePicker(field)}
+        />
         <div className="search-row">
           <button
             type="button"
-            onClick={onOpenDatePicker}
+            className="search-row-trigger"
+            onClick={(event) => {
+              event.stopPropagation()
+              onOpenDatePicker()
+            }}
             aria-label="예약 날짜 선택"
           >
             <CalendarDays />
@@ -3387,15 +3386,17 @@ function RiderHome({
           </button>
           <button
             type="button"
-            onClick={onOpenTimePicker}
-            aria-label="출발 시간 변경"
+            className="search-row-trigger"
+            onClick={(event) => {
+              event.stopPropagation()
+              onOpenTimePicker("departure")
+            }}
+            aria-label="출발 및 희망 도착 시간 설정"
           >
             <Clock3 />
             <span>
               <small>출발 · 희망 도착</small>
-              {formatKoreanTimeLabel(route.departureTime)} →{" "}
-              {route.preferredArrival ||
-                addMinutesToTime24(route.departureTime || "08:30", 30)}
+              {formatKoreanTimeLabel(route.departureTime)} → {arrivalTimeLabel}
             </span>
           </button>
         </div>
@@ -3405,7 +3406,10 @@ function RiderHome({
         <Button
           variant="secondary"
           className="reservation-button"
-          onClick={onOpenDatePicker}
+          onClick={(event) => {
+            event.stopPropagation()
+            onOpenDatePicker()
+          }}
         >
           <CalendarDays /> 원하는 날짜 예약
         </Button>
@@ -3731,7 +3735,7 @@ function DriverHome({
   route: RouteData
   bookingDate: string
   onOpenDatePicker: () => void
-  onOpenTimePicker: () => void
+  onOpenTimePicker: (field?: "departure" | "arrival") => void
   account?: AccountData
   tripFlow: DemoTripFlow
   onStartTrip: () => void
@@ -3747,15 +3751,40 @@ function DriverHome({
   const [endRideId, setEndRideId] = useState<string | null>(null)
   const [decisionApplicationId, setDecisionApplicationId] =
     useState<string | null>(null)
-  const [approved, setApproved] = useState(
-    () => readDemoValue("request-approved") === "true",
-  )
-  const newestRide = carpoolFlow.rides[0]
+  const myDriverRides = carpoolFlow.rides.filter((ride) => {
+    if (!account) return false
+    return (
+      (account.id && ride.driverId === account.id) ||
+      (account.loginId && ride.driverId === account.loginId) ||
+      (account.name && ride.driverName === account.name)
+    )
+  })
+  const newestRide = myDriverRides[0]
   const newestRideApplications = carpoolFlow.applications.filter(
     (item) => item.rideId === newestRide?.id,
   )
   const pendingApplication = newestRideApplications.find(
     (item) => item.status === "승인 대기",
+  )
+  const approvedPassengerCount = newestRideApplications.filter(
+    (item) => item.status === "승인 완료",
+  ).length
+  const maxSeats = newestRide?.totalSeats || 0
+  const remainingSeats = newestRide
+    ? getRemainingSeats(carpoolFlow, newestRide.id)
+    : 0
+  const completedDriverRides = myDriverRides.filter(
+    (ride) => ride.status === "완료",
+  )
+  const monthlyRideCount = completedDriverRides.length
+  const monthlyStudentCount = carpoolFlow.applications.filter(
+    (item) =>
+      item.status === "승인 완료" &&
+      completedDriverRides.some((ride) => ride.id === item.rideId),
+  ).length
+  const monthlyMileage = completedDriverRides.reduce(
+    (sum, ride) => sum + Math.round((ride.price || 0) * 0.1),
+    0,
   )
   return (
     <div className="page">
@@ -3953,11 +3982,15 @@ function DriverHome({
         >
           기본 경로 수정
         </button>
-        <RouteCard small route={route} />
+        <RouteCard small route={route} onOpenTimePicker={onOpenTimePicker} />
         <div className="search-row">
           <button
             type="button"
-            onClick={onOpenDatePicker}
+            className="search-row-trigger"
+            onClick={(event) => {
+              event.stopPropagation()
+              onOpenDatePicker()
+            }}
             aria-label="운행 날짜 선택"
           >
             <CalendarDays />
@@ -3968,8 +4001,12 @@ function DriverHome({
           </button>
           <button
             type="button"
-            onClick={onOpenTimePicker}
-            aria-label="출발 시간 변경"
+            className="search-row-trigger"
+            onClick={(event) => {
+              event.stopPropagation()
+              onOpenTimePicker("departure")
+            }}
+            aria-label="출발 및 희망 도착 시간 변경"
           >
             <Clock3 />
             <span>
@@ -3984,16 +4021,29 @@ function DriverHome({
           <div>
             <span>탑승 확정</span>
             <strong>
-              {approved ? 3 : 2}
-              <small>/3명</small>
+              {approvedPassengerCount}
+              <small>/{maxSeats}명</small>
             </strong>
           </div>
           <div className="seat-dots">
-            <i className="filled" />
-            <i className="filled" />
-            <i className={approved ? "filled" : ""} />
+            {maxSeats > 0 ? (
+              Array.from({ length: maxSeats }, (_, idx) => (
+                <i
+                  key={idx}
+                  className={idx < approvedPassengerCount ? "filled" : ""}
+                />
+              ))
+            ) : (
+              <i />
+            )}
           </div>
-          <span>{approved ? "모집 완료" : "잔여 1석"}</span>
+          <span>
+            {newestRide
+              ? remainingSeats <= 0
+                ? "모집 완료"
+                : `잔여 ${remainingSeats}석`
+              : "예정된 운행 없음"}
+          </span>
         </div>
         <Button
           disabled={
@@ -4140,9 +4190,17 @@ function DriverHome({
           <h2>새 탑승 신청</h2>
           <button onClick={() => open("applications")}>전체보기</button>
         </div>
-        {carpoolFlow.applications.filter((item) => item.status === "승인 대기").length > 0 ? (
+        {carpoolFlow.applications.filter(
+          (item) =>
+            item.status === "승인 대기" &&
+            myDriverRides.some((ride) => ride.id === item.rideId),
+        ).length > 0 ? (
           carpoolFlow.applications
-            .filter((item) => item.status === "승인 대기")
+            .filter(
+              (item) =>
+                item.status === "승인 대기" &&
+                myDriverRides.some((ride) => ride.id === item.rideId),
+            )
             .map((app) => (
               <div className="request-card" key={app.id}>
                 <div
@@ -4245,15 +4303,15 @@ function DriverHome({
         <div className="stats">
           <div>
             <span>완료 운행</span>
-            <strong>8회</strong>
+            <strong>{monthlyRideCount}회</strong>
           </div>
           <div>
             <span>함께한 학생</span>
-            <strong>19명</strong>
+            <strong>{monthlyStudentCount}명</strong>
           </div>
           <div>
             <span>적립 예정</span>
-            <strong>3,420M</strong>
+            <strong>{monthlyMileage.toLocaleString("ko-KR")} M</strong>
           </div>
         </div>
       </section>
@@ -4267,11 +4325,13 @@ function SchedulePage({
   open,
   carpoolFlow,
   onViewUserProfile,
+  account,
 }: {
   role: Role
   open: (sheet: Sheet) => void
   carpoolFlow: DemoCarpoolState
   onViewUserProfile: (target: PublicUserProfileTarget) => void
+  account?: AccountData
 }) {
   const today = new Date()
   const initialWeekStart = new Date(today)
@@ -4289,9 +4349,29 @@ function SchedulePage({
   })
   const selectedKey = formatDateKey(selectedDate)
   const selectedSchedules = demoScheduleByDate[selectedKey] || []
+  const matchesCurrentRider = (riderId?: string, riderName?: string) => {
+    if (!account) return false
+    return (
+      (account.id && riderId === account.id) ||
+      (account.loginId && riderId === account.loginId) ||
+      (account.name && riderName === account.name)
+    )
+  }
   const visibleFlowRides = carpoolFlow.rides.filter((ride) => {
-    if (role === "driver") return true
-    return ride.status === "모집 중" || ride.status === "완료"
+    if (role === "driver") {
+      if (!account) return false
+      return (
+        (account.id && ride.driverId === account.id) ||
+        (account.loginId && ride.driverId === account.loginId) ||
+        (account.name && ride.driverName === account.name)
+      )
+    }
+    const hasMyApp = carpoolFlow.applications.some(
+      (item) =>
+        item.rideId === ride.id &&
+        matchesCurrentRider(item.riderId, item.riderName),
+    )
+    return hasMyApp || ride.status === "모집 중"
   })
   const selectedFlowRides = visibleFlowRides.filter(
     (ride) => ride.date === selectedKey,
@@ -4334,7 +4414,8 @@ function SchedulePage({
           {visibleFlowRides.map((ride) => {
             const application = carpoolFlow.applications.find(
               (item) =>
-                item.rideId === ride.id && item.riderId === "demo-rider",
+                item.rideId === ride.id &&
+                matchesCurrentRider(item.riderId, item.riderName),
             )
             return (
               <article key={ride.id}>
@@ -4412,7 +4493,8 @@ function SchedulePage({
             {selectedFlowRides.map((ride) => {
               const application = carpoolFlow.applications.find(
                 (item) =>
-                  item.rideId === ride.id && item.riderId === "demo-rider",
+                  item.rideId === ride.id &&
+                  matchesCurrentRider(item.riderId, item.riderName),
               )
               return (
                 <article
@@ -5497,8 +5579,13 @@ function ProfilePage({
 
   const myRiderCompletedCount = carpoolFlow.applications.filter(
     (app) =>
-      (app.riderId === account.id || app.riderId === account.loginId) &&
-      app.status === "완료",
+      ((account.id && app.riderId === account.id) ||
+        (account.loginId && app.riderId === account.loginId) ||
+        (account.name && app.riderName === account.name)) &&
+      app.status === "승인 완료" &&
+      carpoolFlow.rides.some(
+        (ride) => ride.id === app.rideId && ride.status === "완료",
+      ),
   ).length
   const activeBadgeIds = useMemo(() => {
     const baseIds = selectedBadges[role] ? [...selectedBadges[role]] : []
@@ -5875,13 +5962,13 @@ function RoleRegistration({
         <Field
           label="기본 출발 지역"
           name="start"
-          defaultValue="모란역 5번 출구"
+          placeholder="예: 모란역 5번 출구"
           icon={<MapPin />}
         />
         <Field
           label="기본 목적지"
           name="destination"
-          defaultValue="신구대학교 정문"
+          placeholder="예: 신구대학교 정문"
           icon={<Navigation />}
         />
         <Field
@@ -6134,8 +6221,10 @@ function SheetView({
     time: route.departureTime || "08:30",
     start: route.start,
     destination: route.destination,
-    vehicle: "흰색 현대 아반떼",
-    totalSeats: "3",
+    vehicle: account.vehicleName || "",
+    totalSeats: String(
+      account.vehicleCapacity ? Math.max(1, account.vehicleCapacity - 1) : 3,
+    ),
     price: "2800",
     waypoints: route.waypoint,
     note: "",
@@ -6160,8 +6249,9 @@ function SheetView({
       time: route.departureTime || prev.time,
       start: route.start || prev.start,
       destination: route.destination || prev.destination,
+      vehicle: prev.vehicle || account.vehicleName || "",
     }))
-  }, [route])
+  }, [route, account.vehicleName])
   const now = new Date()
   const [reservationMonth, setReservationMonth] = useState(
     new Date(now.getFullYear(), now.getMonth(), 1),
@@ -6243,13 +6333,21 @@ function SheetView({
     reservationMonth.getMonth(),
     1,
   ).getDay()
+  const isMyApplication = (item: DemoCarpoolApplication) =>
+    (account.id && item.riderId === account.id) ||
+    (account.loginId && item.riderId === account.loginId) ||
+    (account.name && item.riderName === account.name)
+  const isMyDriverRide = (ride: DemoCarpoolRide) =>
+    (account.id && ride.driverId === account.id) ||
+    (account.loginId && ride.driverId === account.loginId) ||
+    (account.name && ride.driverName === account.name)
   const reservationResults = carpoolFlow.rides.filter(
     (ride) =>
       ride.date === reservationDate &&
       ride.status === "모집 중" &&
       getRemainingSeats(carpoolFlow, ride.id) > 0 &&
       !carpoolFlow.applications.some(
-        (item) => item.rideId === ride.id && item.riderId === "demo-rider",
+        (item) => item.rideId === ride.id && isMyApplication(item),
       ),
   )
 
@@ -6301,34 +6399,29 @@ function SheetView({
     })
     return () => window.cancelAnimationFrame(frame)
   }, [type])
-  const mileageHistoryEntries = [
-    {
-      id: "mileage-0516",
-      date: "5월 16일 09:02",
-      title: "카풀 결제 적립",
-      amount: "+280 M",
-      balance: "12,840 M",
+  const userCompletedRides = carpoolFlow.rides.filter((ride) => {
+    if (ride.status !== "완료") return false
+    if (role === "driver") return isMyDriverRide(ride)
+    return carpoolFlow.applications.some(
+      (app) =>
+        app.rideId === ride.id &&
+        app.status === "승인 완료" &&
+        isMyApplication(app),
+    )
+  })
+  const mileageHistoryEntries = userCompletedRides.map((ride) => {
+    const earned = Math.round((ride.price || 0) * 0.1)
+    return {
+      id: `mileage-${ride.id}`,
+      date: `${ride.date} ${ride.time}`,
+      title: `${ride.start} → ${ride.destination} 카풀 적립`,
+      amount: `+${earned.toLocaleString("ko-KR")} M`,
+      balance: `${mileageBalance.toLocaleString("ko-KR")} M`,
       type: "적립" as const,
-    },
-    {
-      id: "mileage-0512",
-      date: "5월 12일 14:20",
-      title: "교내 카페 데모 사용",
-      amount: "-1,500 M",
-      balance: "12,560 M",
-      type: "사용" as const,
-    },
-    {
-      id: "mileage-0509",
-      date: "5월 9일 08:55",
-      title: "카풀 결제 적립",
-      amount: "+320 M",
-      balance: "14,060 M",
-      type: "적립" as const,
-    },
-  ]
+    }
+  })
   const filteredMileageHistoryEntries = mileageHistoryEntries.filter(
-    (entry) => historyFilter === "전체" || entry.type === historyFilter,
+    (entry) => historyFilter === "전체" || (entry.type as string) === historyFilter,
   )
   const titles: Record<Exclude<Sheet, null>, string> = {
     ride: "카풀 상세",
@@ -6407,14 +6500,39 @@ function SheetView({
       carpoolFlow.applications.some(
         (item) =>
           item.rideId === ride.id &&
-          item.riderId === "demo-rider" &&
+          isMyApplication(item) &&
           item.status === "승인 완료",
       ) &&
       !carpoolFlow.reviews.some((review) => review.rideId === ride.id),
   )
-  const averageReviewScore = (
-    allReviews.reduce((sum, item) => sum + item.score, 0) / allReviews.length
-  ).toFixed(1)
+  const averageReviewScore =
+    allReviews.length > 0
+      ? (
+          allReviews.reduce((sum, item) => sum + item.score, 0) /
+          allReviews.length
+        ).toFixed(1)
+      : "0.0"
+  const myApplicationsList = carpoolFlow.applications.filter((app) => {
+    const ride = carpoolFlow.rides.find((item) => item.id === app.rideId)
+    if (!ride) return false
+    return role === "driver" ? isMyDriverRide(ride) : isMyApplication(app)
+  })
+  const filteredApplicationsList = myApplicationsList.filter((app) => {
+    const ride = carpoolFlow.rides.find((item) => item.id === app.rideId)
+    if (!ride) return false
+    if (applicationFilter === "전체") return true
+    if (applicationFilter === "승인 대기") return app.status === "승인 대기"
+    if (applicationFilter === "탑승 확정")
+      return app.status === "승인 완료" && ride.status !== "완료"
+    if (applicationFilter === "탑승 완료") return ride.status === "완료"
+    if (applicationFilter === "거절") return app.status === "거절"
+    if (applicationFilter === "취소") return app.status === "취소"
+    return true
+  })
+  const latestApplication = myApplicationsList[0]
+  const latestApplicationRide = latestApplication
+    ? carpoolFlow.rides.find((item) => item.id === latestApplication.rideId)
+    : undefined
   const sheetMatches = getVisibleMatchRides(route, carpoolFlow)
   const detailRide = selectedRide ?? sheetMatches[0]
 
@@ -7093,8 +7211,13 @@ function SheetView({
             </div>
             <h3>확정 동승자</h3>
             <div className="co-passengers-list">
-              {[
-                ...carpoolFlow.applications
+              {carpoolFlow.applications.filter(
+                (app) =>
+                  (app.rideId === detailRide.flowRideId ||
+                    app.rideId === detailRide.id) &&
+                  app.status === "승인 완료",
+              ).length > 0 ? (
+                carpoolFlow.applications
                   .filter(
                     (app) =>
                       (app.rideId === detailRide.flowRideId ||
@@ -7105,51 +7228,51 @@ function SheetView({
                     id: app.riderId,
                     name: app.riderName,
                     badge: "매너 탑승자",
-                  })),
-                { id: "rider-seoyeon", name: "이서연", badge: "매너 탑승자" },
-                { id: "rider-woojin", name: "정우진", badge: "시간 엄수" },
-              ]
-                .filter(
-                  (passenger, idx, arr) =>
-                    arr.findIndex((item) => item.name === passenger.name) ===
-                    idx,
-                )
-                .map((passenger) => (
-                  <div
-                    className="co-passenger-chip clickable-profile-trigger"
-                    key={passenger.id}
-                    role="button"
-                    tabIndex={0}
-                    aria-label={`${passenger.name} 탑승자 프로필 상세 보기`}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      onViewUserProfile({
-                        id: passenger.id,
-                        name: passenger.name,
-                        role: "rider",
-                      })
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault()
+                  }))
+                  .filter(
+                    (passenger, idx, arr) =>
+                      arr.findIndex((item) => item.name === passenger.name) ===
+                      idx,
+                  )
+                  .map((passenger) => (
+                    <div
+                      className="co-passenger-chip clickable-profile-trigger"
+                      key={passenger.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${passenger.name} 탑승자 프로필 상세 보기`}
+                      onClick={(event) => {
                         event.stopPropagation()
                         onViewUserProfile({
                           id: passenger.id,
                           name: passenger.name,
                           role: "rider",
                         })
-                      }
-                    }}
-                  >
-                    <div className="avatar small green">
-                      {passenger.name.slice(0, 1)}
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            id: passenger.id,
+                            name: passenger.name,
+                            role: "rider",
+                          })
+                        }
+                      }}
+                    >
+                      <div className="avatar small green">
+                        {passenger.name.slice(0, 1)}
+                      </div>
+                      <div>
+                        <strong>{passenger.name}</strong>
+                        <small>{passenger.badge} · 프로필 보기</small>
+                      </div>
                     </div>
-                    <div>
-                      <strong>{passenger.name}</strong>
-                      <small>{passenger.badge} · 프로필 보기</small>
-                    </div>
-                  </div>
-                ))}
+                  ))
+              ) : (
+                <p className="waypoints">아직 확정된 동승자가 없습니다.</p>
+              )}
             </div>
             <h3>주요 경유지</h3>
             {detailWaypointsLoading ? (
@@ -7706,42 +7829,35 @@ function SheetView({
         )}
         {type === "notifications" && (
           <div className="sheet-content notification-list">
-            {[
-              [
-                "탑승 신청이 도착했어요",
-                "학우님이 5월 20일 카풀에 신청했어요.",
-                "방금 전",
-              ],
-              [
-                "카풀이 승인되었어요",
-                "운전자가 카풀 신청을 승인했어요.",
-                "1시간 전",
-              ],
-              [
-                "출발 30분 전이에요",
-                "탑승 장소와 시간을 다시 확인해 주세요.",
-                "어제",
-              ],
-            ].map((n, i) => (
-              <button
-                key={n[0]}
-                onClick={() => {
-                  void showAppAlert({
-                    title: n[0],
-                    message: n[1],
-                  })
-                }}
-              >
-                <span className={i === 0 ? "new" : ""}>
-                  {i === 0 ? <UsersRound /> : i === 1 ? <Check /> : <Bell />}
-                </span>
-                <div>
-                  <strong>{n[0]}</strong>
-                  <p>{n[1]}</p>
-                  <time>{n[2]}</time>
-                </div>
-              </button>
-            ))}
+            {carpoolFlow.events.length > 0 ? (
+              carpoolFlow.events.map((eventItem, i) => (
+                <button
+                  key={eventItem.id}
+                  onClick={() => {
+                    void showAppAlert({
+                      title: eventItem.title,
+                      message: eventItem.message,
+                    })
+                  }}
+                >
+                  <span className={i === 0 ? "new" : ""}>
+                    {i === 0 ? <UsersRound /> : <Bell />}
+                  </span>
+                  <div>
+                    <strong>{eventItem.title}</strong>
+                    <p>{eventItem.message}</p>
+                    <time>
+                      {new Date(eventItem.createdAt).toLocaleString("ko-KR")}
+                    </time>
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="history-empty">
+                <Bell />
+                <strong>새로운 알림이 없습니다.</strong>
+              </div>
+            )}
           </div>
         )}
         {type === "carpool-payment" && (
@@ -7897,48 +8013,35 @@ function SheetView({
               <button onClick={() => open("history")}>전체보기</button>
             </div>
             <div className="transaction-list">
-              {pointWallet.charges.map((charge) => (
-                <div key={charge.id}>
-                  <span className="transaction-icon green">
-                    <Plus />
-                  </span>
-                  <p>
-                    <strong>
-                      데모 포인트 충전 (+{formatPoints(charge.amount)})
-                    </strong>
-                    <small>
-                      {new Date(charge.createdAt).toLocaleString("ko-KR", {
-                        month: "long",
-                        day: "numeric",
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}{" "}
-                      · {charge.paymentMethod} · {charge.status}
-                    </small>
-                  </p>
-                  <b className="positive">+{formatPoints(charge.amount)}</b>
+              {pointWallet.charges.length > 0 ? (
+                pointWallet.charges.map((charge) => (
+                  <div key={charge.id}>
+                    <span className="transaction-icon green">
+                      <Plus />
+                    </span>
+                    <p>
+                      <strong>
+                        데모 포인트 충전 (+{formatPoints(charge.amount)})
+                      </strong>
+                      <small>
+                        {new Date(charge.createdAt).toLocaleString("ko-KR", {
+                          month: "long",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}{" "}
+                        · {charge.paymentMethod} · {charge.status}
+                      </small>
+                    </p>
+                    <b className="positive">+{formatPoints(charge.amount)}</b>
+                  </div>
+                ))
+              ) : (
+                <div className="history-empty">
+                  <WalletCards />
+                  <strong>최근 포인트 충전 및 이용 내역이 없습니다.</strong>
                 </div>
-              ))}
-              <div>
-                <span className="transaction-icon">
-                  <CarFront />
-                </span>
-                <p>
-                  <strong>모란역 → 신구대학교</strong>
-                  <small>5월 16일 · 결제 완료</small>
-                </p>
-                <b>-2,800 P</b>
-              </div>
-              <div>
-                <span className="transaction-icon green">
-                  <Plus />
-                </span>
-                <p>
-                  <strong>데모 포인트 충전</strong>
-                  <small>5월 10일</small>
-                </p>
-                <b className="positive">+10,000 P</b>
-              </div>
+              )}
             </div>
             {chargeOpen && (
               <div className="point-charge-page">
@@ -8203,15 +8306,15 @@ function SheetView({
             <div className="summary-grid">
               <div>
                 <span>이번 달 적립</span>
-                <strong>3,420 M</strong>
+                <strong>{mileageBalance.toLocaleString("ko-KR")} M</strong>
               </div>
               <div>
                 <span>누적 적립</span>
-                <strong>18,240 M</strong>
+                <strong>{mileageBalance.toLocaleString("ko-KR")} M</strong>
               </div>
               <div>
                 <span>누적 사용</span>
-                <strong>5,400 M</strong>
+                <strong>0 M</strong>
               </div>
             </div>
             <div className="demo-banner">
@@ -8345,45 +8448,28 @@ function SheetView({
               ))}
             </div>
             <div className="application-list">
-              {carpoolFlow.applications.map((application) => {
-                const ride = carpoolFlow.rides.find(
-                  (item) => item.id === application.rideId,
-                )
-                if (!ride) return null
-                return (
-                  <article key={application.id}>
-                    <span
-                      className={`tag ${
-                        application.status === "승인 완료" ? "open" : "waiting"
-                      }`}
-                    >
-                      {ride.status === "완료"
-                        ? "완료된 카풀"
-                        : application.status}
-                    </span>
-                    <h3
-                      className="clickable-profile-inline"
-                      role="button"
-                      tabIndex={0}
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        if (role === "driver") {
-                          onViewUserProfile({
-                            id: application.riderId,
-                            name: application.riderName,
-                            role: "rider",
-                          })
-                        } else {
-                          onViewUserProfile({
-                            name: ride.driverName,
-                            role: "driver",
-                            carInfo: ride.vehicle,
-                          })
-                        }
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault()
+              {filteredApplicationsList.length > 0 ? (
+                filteredApplicationsList.map((application) => {
+                  const ride = carpoolFlow.rides.find(
+                    (item) => item.id === application.rideId,
+                  )
+                  if (!ride) return null
+                  return (
+                    <article key={application.id}>
+                      <span
+                        className={`tag ${
+                          application.status === "승인 완료" ? "open" : "waiting"
+                        }`}
+                      >
+                        {ride.status === "완료"
+                          ? "완료된 카풀"
+                          : application.status}
+                      </span>
+                      <h3
+                        className="clickable-profile-inline"
+                        role="button"
+                        tabIndex={0}
+                        onClick={(event) => {
                           event.stopPropagation()
                           if (role === "driver") {
                             onViewUserProfile({
@@ -8398,219 +8484,147 @@ function SheetView({
                               carInfo: ride.vehicle,
                             })
                           }
-                        }
-                      }}
-                    >
-                      {role === "driver"
-                        ? `${application.riderName} 탑승 신청`
-                        : `${ride.driverName} 운전자`}
-                    </h3>
-                    <p>
-                      {ride.start} → {ride.destination}
-                    </p>
-                    <small>
-                      주요 경유지 ·{" "}
-                      {Array.isArray(ride?.waypointsList) &&
-                      ride.waypointsList.length > 0
-                        ? ride.waypointsList.join(" · ")
-                        : ride.waypoints || DIRECT_ROUTE_LABEL}
-                    </small>
-                    <small>
-                      {ride.date} {ride.time} · {ride.price.toLocaleString()} P
-                      ·{" "}
-                      {new Date(application.createdAt).toLocaleString("ko-KR")}
-                    </small>
-                    <div className="application-card-actions">
-                      <Button
-                        type="button"
-                        variant="soft"
-                        onClick={() =>
-                          onStartCarpoolChat(
-                            role === "driver"
-                              ? {
-                                  id:
-                                    application.riderId ||
-                                    `account-${application.riderName}`,
-                                  name: application.riderName,
-                                  role: "rider",
-                                }
-                              : {
-                                  id:
-                                    ride.driverId ||
-                                    `account-${ride.driverName}`,
-                                  name: ride.driverName,
-                                  role: "driver",
-                                  carInfo: ride.vehicle,
-                                  licenseVerified: true,
-                                },
-                            {
-                              id: ride.id,
-                              start: ride.start,
-                              destination: ride.destination,
-                              date: ride.date,
-                              time: ride.time,
-                              waypoints: ride.waypoints || DIRECT_ROUTE_LABEL,
-                            },
-                          )
-                        }
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            if (role === "driver") {
+                              onViewUserProfile({
+                                id: application.riderId,
+                                name: application.riderName,
+                                role: "rider",
+                              })
+                            } else {
+                              onViewUserProfile({
+                                name: ride.driverName,
+                                role: "driver",
+                                carInfo: ride.vehicle,
+                              })
+                            }
+                          }
+                        }}
                       >
-                        <MessageCircle /> 1:1 채팅하기
-                      </Button>
-                    </div>
-                    {role === "driver" &&
-                      application.status === "승인 대기" && (
-                        <div>
+                        {role === "driver"
+                          ? `${application.riderName} 탑승 신청`
+                          : `${ride.driverName} 운전자`}
+                      </h3>
+                      <p>
+                        {ride.start} → {ride.destination}
+                      </p>
+                      <small>
+                        주요 경유지 ·{" "}
+                        {Array.isArray(ride?.waypointsList) &&
+                        ride.waypointsList.length > 0
+                          ? ride.waypointsList.join(" · ")
+                          : ride.waypoints || DIRECT_ROUTE_LABEL}
+                      </small>
+                      <small>
+                        {ride.date} {ride.time} · {ride.price.toLocaleString()} P
+                        ·{" "}
+                        {new Date(application.createdAt).toLocaleString("ko-KR")}
+                      </small>
+                      <div className="application-card-actions">
+                        <Button
+                          type="button"
+                          variant="soft"
+                          onClick={() =>
+                            onStartCarpoolChat(
+                              role === "driver"
+                                ? {
+                                    id:
+                                      application.riderId ||
+                                      `account-${application.riderName}`,
+                                    name: application.riderName,
+                                    role: "rider",
+                                  }
+                                : {
+                                    id:
+                                      ride.driverId ||
+                                      `account-${ride.driverName}`,
+                                    name: ride.driverName,
+                                    role: "driver",
+                                    carInfo: ride.vehicle,
+                                    licenseVerified: true,
+                                  },
+                              {
+                                id: ride.id,
+                                start: ride.start,
+                                destination: ride.destination,
+                                date: ride.date,
+                                time: ride.time,
+                                waypoints: ride.waypoints || DIRECT_ROUTE_LABEL,
+                              },
+                            )
+                          }
+                        >
+                          <MessageCircle /> 1:1 채팅하기
+                        </Button>
+                      </div>
+                      {role === "driver" &&
+                        application.status === "승인 대기" && (
+                          <div>
+                            <Button
+                              variant="ghost"
+                              onClick={() =>
+                                decideCarpoolApplication(application.id, "reject")
+                              }
+                            >
+                              거절
+                            </Button>
+                            <Button
+                              onClick={() =>
+                                decideCarpoolApplication(
+                                  application.id,
+                                  "approve",
+                                )
+                              }
+                            >
+                              승인
+                            </Button>
+                          </div>
+                        )}
+                      {role === "rider" &&
+                        (application.status === "승인 대기" ||
+                          application.status === "승인 완료") && (
                           <Button
                             variant="ghost"
-                            onClick={() =>
-                              decideCarpoolApplication(application.id, "reject")
-                            }
+                            onClick={async () => {
+                              const ok = await showAppConfirm({
+                                title: "예약 취소 확인",
+                                message: "카풀 예약을 취소할까요?",
+                                confirmText: "예약 취소",
+                                cancelText: "돌아가기",
+                                variant: "danger",
+                              })
+                              if (!ok) return
+                              cancelCarpoolApplication(application.id)
+                            }}
                           >
-                            거절
+                            예약 취소
                           </Button>
-                          <Button
-                            onClick={() =>
-                              decideCarpoolApplication(
-                                application.id,
-                                "approve",
-                              )
-                            }
-                          >
-                            승인
+                        )}
+                      {role === "rider" &&
+                        ride.status === "완료" &&
+                        !carpoolFlow.reviews.some(
+                          (review) => review.rideId === ride.id,
+                        ) && (
+                          <Button variant="soft" onClick={() => open("review")}>
+                            후기 작성
                           </Button>
-                        </div>
-                      )}
-                    {role === "rider" &&
-                      (application.status === "승인 대기" ||
-                        application.status === "승인 완료") && (
-                        <Button
-                          variant="ghost"
-                          onClick={async () => {
-                            const ok = await showAppConfirm({
-                              title: "예약 취소 확인",
-                              message: "카풀 예약을 취소할까요?",
-                              confirmText: "예약 취소",
-                              cancelText: "돌아가기",
-                              variant: "danger",
-                            })
-                            if (!ok) return
-                            cancelCarpoolApplication(application.id)
-                          }}
-                        >
-                          예약 취소
-                        </Button>
-                      )}
-                    {role === "rider" &&
-                      ride.status === "완료" &&
-                      !carpoolFlow.reviews.some(
-                        (review) => review.rideId === ride.id,
-                      ) && (
-                        <Button variant="soft" onClick={() => open("review")}>
-                          후기 작성
-                        </Button>
-                      )}
-                  </article>
-                )
-              })}
-              {(applicationFilter === "전체" ||
-                applicationFilter === "승인 대기") && (
-                <article>
-                  <span
-                    className={`tag ${
-                      applicationCancelled ? "waiting" : "waiting"
-                    }`}
-                  >
-                    {applicationCancelled ? "취소" : "승인 대기"}
-                  </span>
-                  <h3
-                    className="clickable-profile-inline"
-                    role="button"
-                    tabIndex={0}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      onViewUserProfile({
-                        name: role === "driver" ? "탑승자" : "운전자",
-                        role: role === "driver" ? "rider" : "driver",
-                      })
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault()
-                        event.stopPropagation()
-                        onViewUserProfile({
-                          name: role === "driver" ? "탑승자" : "운전자",
-                          role: role === "driver" ? "rider" : "driver",
-                        })
-                      }
-                    }}
-                  >
-                    {role === "driver" ? "탑승 신청" : "카풀 운전자"}
-                  </h3>
-                  <p>태평역 → 신구대학교</p>
-                  <small>5월 21일 오전 8:15 · 2,800 P · 잔여 1석</small>
-                  <div>
-                    <Button
-                      variant="soft"
-                      onClick={() => open("application-detail")}
-                    >
-                      상세 보기
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      disabled={applicationCancelled}
-                      onClick={async () => {
-                        const ok = await showAppConfirm({
-                          title: "신청 취소 확인",
-                          message: "탑승 신청을 취소할까요?",
-                          confirmText: "신청 취소",
-                          cancelText: "돌아가기",
-                          variant: "danger",
-                        })
-                        if (ok) {
-                          writeDemoValue("application-0521", "cancelled")
-                          setApplicationCancelled(true)
-                        }
-                      }}
-                    >
-                      {applicationCancelled ? "취소 완료" : "신청 취소"}
-                    </Button>
-                  </div>
-                </article>
-              )}
-              {(applicationFilter === "전체" ||
-                applicationFilter === "탑승 완료") && (
-                <article>
-                  <span className="tag open">탑승 완료</span>
-                  <h3
-                    className="clickable-profile-inline"
-                    role="button"
-                    tabIndex={0}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      onViewUserProfile({
-                        name: "운전자",
-                        role: "driver",
-                      })
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault()
-                        event.stopPropagation()
-                        onViewUserProfile({
-                          name: "운전자",
-                          role: "driver",
-                        })
-                      }
-                    }}
-                  >
-                    운전자
-                  </h3>
-                  <p>모란역 → 신구대학교</p>
-                  <small>5월 16일 오전 8:10 · 결제 완료</small>
-                  <Button variant="soft" onClick={() => open("review")}>
-                    {reviewed ? "후기 작성 완료" : "후기 작성"}
-                  </Button>
-                </article>
+                        )}
+                    </article>
+                  )
+                })
+              ) : (
+                <div className="history-empty">
+                  <CalendarDays />
+                  <strong>
+                    {role === "driver"
+                      ? "예정된 운행 및 신청 내역이 없습니다."
+                      : "신청한 카풀 내역이 없습니다."}
+                  </strong>
+                </div>
               )}
             </div>
           </div>
@@ -8650,7 +8664,9 @@ function SheetView({
                 </h2>
                 <p>{latestApplicationRide?.vehicle || "면허 인증 완료"}</p>
                 <span className="tag waiting">
-                  {applicationCancelled ? "취소" : "승인 대기"}
+                  {applicationCancelled
+                    ? "취소"
+                    : latestApplication?.status || "승인 대기"}
                 </span>
               </div>
             </div>
@@ -8659,13 +8675,23 @@ function SheetView({
               <div>
                 <Clock3 />
                 <span>
-                  출발<strong>5월 21일 오전 8:15</strong>
+                  출발
+                  <strong>
+                    {latestApplicationRide
+                      ? `${latestApplicationRide.date} ${latestApplicationRide.time}`
+                      : formatKoreanTimeLabel(route.departureTime)}
+                  </strong>
                 </span>
               </div>
               <div>
                 <WalletCards />
                 <span>
-                  예상 결제<strong>2,800 P</strong>
+                  예상 결제
+                  <strong>
+                    {latestApplicationRide
+                      ? `${latestApplicationRide.price.toLocaleString("ko-KR")} P`
+                      : "0 P"}
+                  </strong>
                 </span>
               </div>
             </div>
@@ -8692,11 +8718,15 @@ function SheetView({
                     licenseVerified: true,
                   },
                   {
-                    id: "application-0521",
-                    start: route.start || "태평역",
-                    destination: route.destination || "신구대학교",
-                    date: "5월 21일",
-                    time: "08:15",
+                    id: latestApplicationRide?.id || "application-detail",
+                    start: latestApplicationRide?.start || route.start,
+                    destination:
+                      latestApplicationRide?.destination || route.destination,
+                    date: latestApplicationRide?.date || getTodayDateKey(),
+                    time:
+                      latestApplicationRide?.time ||
+                      route.departureTime ||
+                      "08:30",
                     waypoints:
                       getExtractedWaypointsSync(
                         route.start || "태평역",
@@ -8721,7 +8751,9 @@ function SheetView({
                   variant: "danger",
                 })
                 if (ok) {
-                  writeDemoValue("application-0521", "cancelled")
+                  if (latestApplication) {
+                    cancelCarpoolApplication(latestApplication.id)
+                  }
                   setApplicationCancelled(true)
                 }
               }}
@@ -8736,15 +8768,28 @@ function SheetView({
               <div className="summary-grid monthly-summary">
                 <div>
                   <span>완료 운행</span>
-                  <strong>8회</strong>
+                  <strong>{userCompletedRides.length}회</strong>
                 </div>
                 <div>
                   <span>결제 완료</span>
-                  <strong>34,200 P</strong>
+                  <strong>
+                    {userCompletedRides
+                      .reduce((sum, r) => sum + (r.price || 0), 0)
+                      .toLocaleString("ko-KR")}{" "}
+                    P
+                  </strong>
                 </div>
                 <div>
                   <span>적립</span>
-                  <strong>3,420 M</strong>
+                  <strong>
+                    {userCompletedRides
+                      .reduce(
+                        (sum, r) => sum + Math.round((r.price || 0) * 0.1),
+                        0,
+                      )
+                      .toLocaleString("ko-KR")}{" "}
+                    M
+                  </strong>
                 </div>
               </div>
             )}
@@ -9241,17 +9286,25 @@ function SheetView({
               <Field
                 label="전화번호"
                 type="tel"
-                placeholder="예: 01012345678 ('-' 없이 숫자만 입력)"
+                placeholder="숫자만 입력 (자동 하이픈 적용)"
                 maxLength={13}
                 value={accountDraft.phone}
                 onChange={(event) =>
                   setAccountDraft({
                     ...accountDraft,
-                    phone: event.target.value.replace(/[^0-9-]/g, "").slice(0, 13),
+                    phone: formatPhoneInput(
+                      event.target.value,
+                      accountDraft.phone,
+                    ),
                   })
                 }
                 disabled={!isEditingAccount}
               />
+              {isEditingAccount && !isValidPhoneNumber(accountDraft.phone) && (
+                <small className="helper">
+                  숫자 11자리(010-0000-0000)를 모두 입력해 주세요.
+                </small>
+              )}
               <Field
                 label="성별 · 비공개"
                 value={accountDraft.gender}
@@ -9526,21 +9579,24 @@ function SheetView({
                 <small>후기 {allReviews.length}개</small>
               </div>
               <div className="rating-bars">
-                {[
-                  [5, 78],
-                  [4, 18],
-                  [3, 4],
-                  [2, 0],
-                  [1, 0],
-                ].map(([score, width]) => (
-                  <div key={score}>
-                    <span>{score}</span>
-                    <i>
-                      <b style={{ width: `${width}%` }} />
-                    </i>
-                    <small>{width}%</small>
-                  </div>
-                ))}
+                {[5, 4, 3, 2, 1].map((score) => {
+                  const count = allReviews.filter(
+                    (item) => Math.round(item.score) === score,
+                  ).length
+                  const width =
+                    allReviews.length > 0
+                      ? Math.round((count / allReviews.length) * 100)
+                      : 0
+                  return (
+                    <div key={score}>
+                      <span>{score}</span>
+                      <i>
+                        <b style={{ width: `${width}%` }} />
+                      </i>
+                      <small>{width}%</small>
+                    </div>
+                  )
+                })}
               </div>
             </section>
 
@@ -9554,26 +9610,41 @@ function SheetView({
               <div className="manner-list">
                 {(role === "driver"
                   ? [
-                      ["급정거 없이 안전해요", 92, 11],
-                      ["약속 시간을 잘 지켜요", 84, 9],
-                      ["차량이 깨끗해요", 71, 7],
+                      "급정거 없이 안전해요",
+                      "약속 시간을 잘 지켜요",
+                      "차량이 깨끗해요",
                     ]
                   : [
-                      ["친절하고 매너가 좋아요", 94, 12],
-                      ["약속 시간을 잘 지켜요", 82, 9],
-                      ["탑승 규칙을 잘 지켜요", 68, 7],
+                      "친절하고 매너가 좋아요",
+                      "약속 시간을 잘 지켜요",
+                      "탑승 규칙을 잘 지켜요",
                     ]
-                ).map(([label, progress, count]) => (
-                  <div key={String(label)}>
-                    <p>
-                      <strong>{label}</strong>
-                      <span>{count}명</span>
-                    </p>
-                    <i>
-                      <b style={{ width: `${progress}%` }} />
-                    </i>
-                  </div>
-                ))}
+                ).map((label) => {
+                  const count = allReviews.filter((item) =>
+                    item.tags?.some((tag) =>
+                      tag.includes(label.slice(0, 4)) ||
+                      label.includes(tag.slice(0, 4)),
+                    ),
+                  ).length
+                  const progress =
+                    allReviews.length > 0
+                      ? Math.min(
+                          100,
+                          Math.round((count / allReviews.length) * 100),
+                        )
+                      : 0
+                  return (
+                    <div key={label}>
+                      <p>
+                        <strong>{label}</strong>
+                        <span>{count}명</span>
+                      </p>
+                      <i>
+                        <b style={{ width: `${progress}%` }} />
+                      </i>
+                    </div>
+                  )
+                })}
               </div>
             </section>
 
@@ -9582,49 +9653,56 @@ function SheetView({
                 <h2>개별 후기</h2>
                 <span>최신순</span>
               </div>
-              {allReviews.map((reviewItem) => (
-                <article key={`${reviewItem.date}-${reviewItem.score}`}>
-                  <header
-                    className="clickable-profile-trigger"
-                    role="button"
-                    tabIndex={0}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      onViewUserProfile({
-                        name: reviewItem.author,
-                        role: role === "driver" ? "rider" : "driver",
-                      })
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault()
+              {allReviews.length > 0 ? (
+                allReviews.map((reviewItem, idx) => (
+                  <article key={`${reviewItem.date}-${reviewItem.score}-${idx}`}>
+                    <header
+                      className="clickable-profile-trigger"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
                         event.stopPropagation()
                         onViewUserProfile({
                           name: reviewItem.author,
                           role: role === "driver" ? "rider" : "driver",
                         })
-                      }
-                    }}
-                  >
-                    <div className="reviewer-avatar">
-                      <UserRound />
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onViewUserProfile({
+                            name: reviewItem.author,
+                            role: role === "driver" ? "rider" : "driver",
+                          })
+                        }
+                      }}
+                    >
+                      <div className="reviewer-avatar">
+                        <UserRound />
+                      </div>
+                      <div>
+                        <strong>{reviewItem.author}</strong>
+                        <span>{reviewItem.date}</span>
+                      </div>
+                      <b>
+                        <Star /> {reviewItem.score.toFixed(1)}
+                      </b>
+                    </header>
+                    <p>{reviewItem.text}</p>
+                    <div className="review-tags">
+                      {reviewItem.tags.map((tag) => (
+                        <span key={tag}>{tag}</span>
+                      ))}
                     </div>
-                    <div>
-                      <strong>{reviewItem.author}</strong>
-                      <span>{reviewItem.date}</span>
-                    </div>
-                    <b>
-                      <Star /> {reviewItem.score.toFixed(1)}
-                    </b>
-                  </header>
-                  <p>{reviewItem.text}</p>
-                  <div className="review-tags">
-                    {reviewItem.tags.map((tag) => (
-                      <span key={tag}>{tag}</span>
-                    ))}
-                  </div>
-                </article>
-              ))}
+                  </article>
+                ))
+              ) : (
+                <div className="history-empty">
+                  <Star />
+                  <strong>아직 받은 후기가 없습니다.</strong>
+                </div>
+              )}
             </section>
           </div>
         )}
@@ -10194,6 +10272,7 @@ function SheetView({
             <RoleRegistration
               role={type === "driver-register" ? "driver" : "rider"}
               onComplete={onCompleteRole}
+              account={account}
             />
           </div>
         )}
@@ -11004,6 +11083,8 @@ export default function App() {
   })
   const [homeDatePickerOpen, setHomeDatePickerOpen] = useState(false)
   const [homeTimePickerOpen, setHomeTimePickerOpen] = useState(false)
+  const [homeTimePickerField, setHomeTimePickerField] =
+    useState<"departure" | "arrival">("departure")
   const [viewingUserProfile, setViewingUserProfile] =
     useState<PublicUserProfileData | null>(null)
   const [chatAlertModal, setChatAlertModal] = useState<{
@@ -11231,45 +11312,6 @@ export default function App() {
 
   useEffect(() => {
     const splashTimer = window.setTimeout(() => setSplash(false), 3000)
-    if (isSupabaseConfigured()) {
-      supabaseGetCurrentUser()
-        .then((user) => {
-          if (user) {
-            setLoggedIn(true)
-            const meta = user.user_metadata
-            const isDriverVerified = Boolean(meta?.isDriverVerified)
-            setAccount((prev) => ({
-              ...prev,
-              id: user.id,
-              email: user.email || prev.email,
-              name: meta?.name || prev.name,
-              phone: meta?.phone || prev.phone,
-              gender: meta?.gender || prev.gender,
-              isDriverVerified: isDriverVerified || prev.isDriverVerified,
-              licenseFileName: meta?.licenseFileName || prev.licenseFileName,
-              vehicleName: meta?.vehicleName || prev.vehicleName,
-              vehicleCapacity: meta?.vehicleCapacity
-                ? Number(meta.vehicleCapacity)
-                : prev.vehicleCapacity,
-            }))
-            if (isDriverVerified) {
-              setSelectedBadges((prev) => {
-                if (prev.driver.includes("driver-license")) return prev
-                const nextBadges = {
-                  ...prev,
-                  driver: ["driver-license", ...prev.driver].slice(0, 3),
-                }
-                writeDemoData("selected-badges", nextBadges)
-                return nextBadges
-              })
-            }
-            if (meta?.role === "driver" || meta?.role === "rider") {
-              setRole(meta.role)
-            }
-          }
-        })
-        .catch(console.warn)
-    }
     return () => window.clearTimeout(splashTimer)
   }, [])
 
@@ -11299,6 +11341,16 @@ export default function App() {
     }
     setRole(next)
     writeDemoValue("demo-role", next)
+    setAccount((prev) => {
+      const updatedAccount: AccountData = { ...prev, role: next }
+      writeDemoData("account", updatedAccount)
+      if (isSupabaseConfigured() && updatedAccount.id) {
+        supabaseUpdateProfile(updatedAccount.id, updatedAccount).catch(
+          console.warn,
+        )
+      }
+      return updatedAccount
+    })
     setTab("home")
     setSheet(null)
   }
@@ -11320,7 +11372,7 @@ export default function App() {
     setRegistrations(updated)
     writeDemoData("role-registrations", updated)
     if (next === "driver") {
-      const nextAccount = { ...account, isDriverVerified: true }
+      const nextAccount = { ...account, isDriverVerified: true, role: next }
       setAccount(nextAccount)
       writeDemoData("account", nextAccount)
       setSelectedBadges((prev) => {
@@ -11344,6 +11396,7 @@ export default function App() {
           open={setSheet}
           carpoolFlow={carpoolFlow}
           onViewUserProfile={openUserProfile}
+          account={account}
         />
       )
     if (tab === "chat")
@@ -11391,7 +11444,10 @@ export default function App() {
         route={routesByRole.driver}
         bookingDate={bookingDate}
         onOpenDatePicker={() => setHomeDatePickerOpen(true)}
-        onOpenTimePicker={() => setHomeTimePickerOpen(true)}
+        onOpenTimePicker={(field = "departure") => {
+          setHomeTimePickerField(field)
+          setHomeTimePickerOpen(true)
+        }}
         account={account}
         tripFlow={tripFlow}
         onStartTrip={startDemoTrip}
@@ -11412,7 +11468,10 @@ export default function App() {
         route={routesByRole.rider}
         bookingDate={bookingDate}
         onOpenDatePicker={() => setHomeDatePickerOpen(true)}
-        onOpenTimePicker={() => setHomeTimePickerOpen(true)}
+        onOpenTimePicker={(field = "departure") => {
+          setHomeTimePickerField(field)
+          setHomeTimePickerOpen(true)
+        }}
         tripFlow={tripFlow}
         carpoolFlow={carpoolFlow}
         onOpenChat={(rideId) => {
@@ -11461,9 +11520,11 @@ export default function App() {
         <Auth
           view={auth}
           setView={setAuth}
-          onLogin={(nextRole, userProfile) => {
+          onLogin={(nextRole, userProfile, isNewSignup) => {
             setRole(nextRole)
             setLoggedIn(true)
+            setTab("home")
+            setSheet(null)
             const fallbackId = nextRole === "driver" ? "driver" : "student"
             const fallbackName =
               userProfile?.name ||
@@ -11471,7 +11532,7 @@ export default function App() {
               (nextRole === "driver" ? "운전자" : "학우")
             const fallbackEmail = `${fallbackId}@shingu.ac.kr`
             const mergedAccount: AccountData = {
-              ...account,
+              ...(isNewSignup ? defaultAccount : account),
               ...userProfile,
               id:
                 userProfile?.id ||
@@ -11486,10 +11547,24 @@ export default function App() {
                 fallbackId,
               name: userProfile?.name || account.name || fallbackName,
               email: userProfile?.email || account.email || fallbackEmail,
+              role: nextRole,
             }
             setAccount(mergedAccount)
             writeDemoData("account", mergedAccount)
-            if (mergedAccount.isDriverVerified) {
+            if (isNewSignup) {
+              setRoutesByRole(defaultRoutes)
+              writeDemoData("routes", defaultRoutes)
+              writeDemoData("received-reviews", [])
+              resetDemoTrip()
+              const freshBadges: Record<Role, string[]> = {
+                rider: [],
+                driver: mergedAccount.isDriverVerified
+                  ? ["driver-license"]
+                  : [],
+              }
+              setSelectedBadges(freshBadges)
+              writeDemoData("selected-badges", freshBadges)
+            } else if (mergedAccount.isDriverVerified) {
               setSelectedBadges((prev) => {
                 const driverBadges = prev.driver.includes("driver-license")
                   ? prev.driver
@@ -11504,9 +11579,9 @@ export default function App() {
             }
             writeDemoValue("demo-login", "true")
             writeDemoValue("demo-role", nextRole)
-            const updated = {
-              ...safeRegistrations,
-              [nextRole]: true,
+            const updated: RoleRegistrations = {
+              rider: true,
+              driver: true,
             }
             setRegistrations(updated)
             writeDemoData("role-registrations", updated)
@@ -11560,6 +11635,7 @@ export default function App() {
           resolveValidArrivalTime24(routesByRole[role].departureTime || "08:30")
             .arrival24
         }
+        initialField={homeTimePickerField}
         title="출발 · 희망 도착 시간 설정"
         subtitle="출발 시간과 희망 도착 시간을 설정하면 기본 경로, 예약 내역, 상세 카드 등 모든 시간 데이터가 실시간 동기화됩니다."
         onClose={() => setHomeTimePickerOpen(false)}
