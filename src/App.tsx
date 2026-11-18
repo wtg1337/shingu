@@ -650,13 +650,13 @@ function CustomDatePickerModal({
 
   return (
     <div
-      className="dialog-backdrop flow-dialog-backdrop custom-picker-backdrop"
+      className="dialog-backdrop custom-picker-backdrop fixed inset-0 flex items-center justify-center"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose()
       }}
     >
       <section
-        className="app-dialog custom-calendar-dialog"
+        className="app-dialog custom-calendar-dialog w-[90%] max-w-[380px]"
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -1347,13 +1347,13 @@ function CustomTimePickerModal({
 
   return (
     <div
-      className="dialog-backdrop flow-dialog-backdrop custom-picker-backdrop"
+      className="dialog-backdrop custom-picker-backdrop fixed inset-0 flex items-center justify-center"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose()
       }}
     >
       <section
-        className="app-dialog custom-time-dialog"
+        className="app-dialog custom-time-dialog w-[90%] max-w-[380px]"
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -1708,19 +1708,30 @@ function Auth({
   } | null>(null)
   const [authLoading, setAuthLoading] = useState(false)
   const [authError, setAuthError] = useState("")
+  const [biometricLoginModal, setBiometricLoginModal] = useState<{
+    supported: boolean
+    title: string
+    message: string
+  } | null>(null)
+  const isBiometricLoginEnabled = getBiometricDemoState()
+  const safeView: AuthView =
+    view === "signup" || view === "reset" ? view : "login"
 
   const getRegisteredMembers = (): StoredMemberRecord[] => {
-    const savedList = readDemoData<StoredMemberRecord[]>(
+    const rawSavedList = readDemoData<StoredMemberRecord[]>(
       "registered-users",
       DEFAULT_REGISTERED_USERS,
     )
-    const merged = [...savedList]
+    const savedList = Array.isArray(rawSavedList) ? rawSavedList : []
+    const merged = savedList.filter(Boolean)
     for (const def of DEFAULT_REGISTERED_USERS) {
       if (
         !merged.some(
           (item) =>
-            item.loginId.toLowerCase() === def.loginId.toLowerCase() &&
-            item.email.toLowerCase() === def.email.toLowerCase(),
+            (item?.loginId || "").toLowerCase() ===
+              (def?.loginId || "").toLowerCase() &&
+            (item?.email || "").toLowerCase() ===
+              (def?.email || "").toLowerCase(),
         )
       ) {
         merged.push(def)
@@ -1728,17 +1739,18 @@ function Auth({
     }
     const savedAccount = readDemoData<AccountData>("account", defaultAccount)
     if (savedAccount?.email && (savedAccount.loginId || savedAccount.id)) {
-      const accLoginId = savedAccount.loginId || savedAccount.id
+      const accLoginId = savedAccount.loginId || savedAccount.id || ""
       if (
         !merged.some(
           (item) =>
-            item.email.toLowerCase() === savedAccount.email.toLowerCase() &&
-            (item.loginId.toLowerCase() === accLoginId.toLowerCase() ||
-              item.id.toLowerCase() === accLoginId.toLowerCase()),
+            (item?.email || "").toLowerCase() ===
+              (savedAccount.email || "").toLowerCase() &&
+            ((item?.loginId || "").toLowerCase() === accLoginId.toLowerCase() ||
+              (item?.id || "").toLowerCase() === accLoginId.toLowerCase()),
         )
       ) {
         merged.unshift({
-          id: savedAccount.id,
+          id: savedAccount.id || accLoginId,
           loginId: accLoginId,
           email: savedAccount.email,
           password: savedAccount.password || "shingu1234!",
@@ -1760,8 +1772,10 @@ function Auth({
     const filtered = current.filter(
       (item) =>
         !(
-          item.loginId.toLowerCase() === record.loginId.toLowerCase() ||
-          item.email.toLowerCase() === record.email.toLowerCase()
+          (item?.loginId || "").toLowerCase() ===
+            (record?.loginId || "").toLowerCase() ||
+          (item?.email || "").toLowerCase() ===
+            (record?.email || "").toLowerCase()
         ),
     )
     const updated = [record, ...filtered]
@@ -1769,8 +1783,52 @@ function Auth({
   }
 
   const isValidSchoolEmail = (value: string) => {
-    const trimmed = value.trim().toLowerCase()
+    const trimmed = (value || "").trim().toLowerCase()
     return /^[^\s@]+@[^\s@]+\.(ac\.kr|edu)$/i.test(trimmed)
+  }
+
+  const performBiometricAutoLogin = () => {
+    const savedBio = getBiometricAccount()
+    if (savedBio?.account?.email || savedBio?.account?.name) {
+      onLogin(savedBio.role || "rider", savedBio.account)
+      return
+    }
+    const storedAccount = readDemoData<AccountData>("account", defaultAccount)
+    const savedRole = (readDemoValue("demo-role") as Role) || "rider"
+    if (storedAccount?.email || storedAccount?.name) {
+      onLogin(savedRole, storedAccount)
+      return
+    }
+    void showAppAlert({
+      title: "등록된 생체인증 계정 없음",
+      message:
+        "먼저 로그인 또는 회원가입 후 보안 설정에서 생체인증을 등록해 주세요.",
+    })
+  }
+
+  const handleBiometricLoginClick = async () => {
+    setAuthError("")
+    try {
+      const hardware = await checkBiometricHardwareSupport()
+      if (hardware.supported) {
+        performBiometricAutoLogin()
+        return
+      }
+      setBiometricLoginModal({
+        supported: false,
+        title: "생체인증 센서 확인 안내",
+        message:
+          hardware.reason ||
+          "현재 기기 또는 브라우저에서는 생체인증(지문/Face ID) 하드웨어를 지원하지 않습니다. 일반 아이디/비밀번호 로그인을 유지하거나 테스트 생체인증 확인으로 로그인할 수 있습니다.",
+      })
+    } catch {
+      setBiometricLoginModal({
+        supported: false,
+        title: "생체인증 센서 미지원 환경",
+        message:
+          "생체인증 하드웨어를 사용할 수 없는 환경입니다. 일반 로그인을 이용해 주세요.",
+      })
+    }
   }
 
   const handleSendEmailCode = async () => {
@@ -2232,8 +2290,8 @@ function Auth({
   }
 
   const handleResetPassword = async () => {
-    const trimmedId = resetId.trim()
-    const trimmedEmail = resetEmail.trim()
+    const trimmedId = (resetId || "").trim()
+    const trimmedEmail = (resetEmail || "").trim()
     setResetInlineError("")
     if (!trimmedId || !trimmedEmail) {
       const msg = !trimmedId && !trimmedEmail
@@ -2250,11 +2308,14 @@ function Auth({
     }
     const members = getRegisteredMembers()
     const matched = members.find((member) => {
-      const emailMatch = member.email.toLowerCase() === trimmedEmail.toLowerCase()
-      const emailPrefix = member.email.split("@")[0]?.toLowerCase() || ""
+      const memberEmail = (member?.email || "").toLowerCase()
+      const memberLoginId = (member?.loginId || "").toLowerCase()
+      const memberId = (member?.id || "").toLowerCase()
+      const emailMatch = memberEmail === trimmedEmail.toLowerCase()
+      const emailPrefix = memberEmail.split("@")[0]?.toLowerCase() || ""
       const idMatch =
-        member.loginId.toLowerCase() === trimmedId.toLowerCase() ||
-        member.id.toLowerCase() === trimmedId.toLowerCase() ||
+        memberLoginId === trimmedId.toLowerCase() ||
+        memberId === trimmedId.toLowerCase() ||
         emailPrefix === trimmedId.toLowerCase()
       return emailMatch || idMatch
     })
@@ -2487,10 +2548,11 @@ function Auth({
     }
   }
 
-  if (view === "reset") {
+  if (safeView === "reset") {
     return (
       <main className="auth auth--reset">
         <button
+          type="button"
           className="icon-button auth__back"
           onClick={() => {
             if (resetVerified) {
@@ -2499,6 +2561,7 @@ function Auth({
               return
             }
             setResetModal(null)
+            setResetInlineError("")
             setView("login")
           }}
           aria-label="뒤로 가기"
@@ -2613,11 +2676,12 @@ function Auth({
     )
   }
 
-  if (view === "signup") {
+  if (safeView === "signup") {
     return (
       <main className="auth auth--signup">
         <div className="signup-top">
           <button
+            type="button"
             className="icon-button"
             onClick={() => (step === 1 ? setView("login") : setStep(step - 1))}
             aria-label="뒤로 가기"
@@ -2955,6 +3019,7 @@ function Auth({
         )}
         <div className="signup-footer">
           <Button
+            type="button"
             disabled={authLoading}
             onClick={() => void handleNextSignupStep()}
           >
@@ -2969,56 +3034,6 @@ function Auth({
         </div>
       </main>
     )
-  }
-
-  const isBiometricLoginEnabled = getBiometricDemoState()
-  const [biometricLoginModal, setBiometricLoginModal] = useState<{
-    supported: boolean
-    title: string
-    message: string
-  } | null>(null)
-
-  const performBiometricAutoLogin = () => {
-    const savedBio = getBiometricAccount()
-    if (savedBio?.account?.email || savedBio?.account?.name) {
-      onLogin(savedBio.role || "rider", savedBio.account)
-      return
-    }
-    const storedAccount = readDemoData<AccountData>("account", defaultAccount)
-    const savedRole = (readDemoValue("demo-role") as Role) || "rider"
-    if (storedAccount?.email || storedAccount?.name) {
-      onLogin(savedRole, storedAccount)
-      return
-    }
-    void showAppAlert({
-      title: "등록된 생체인증 계정 없음",
-      message: "먼저 로그인 또는 회원가입 후 보안 설정에서 생체인증을 등록해 주세요.",
-    })
-  }
-
-  const handleBiometricLoginClick = async () => {
-    setAuthError("")
-    try {
-      const hardware = await checkBiometricHardwareSupport()
-      if (hardware.supported) {
-        performBiometricAutoLogin()
-        return
-      }
-      setBiometricLoginModal({
-        supported: false,
-        title: "생체인증 센서 확인 안내",
-        message:
-          hardware.reason ||
-          "현재 기기 또는 브라우저에서는 생체인증(지문/Face ID) 하드웨어를 지원하지 않습니다. 일반 아이디/비밀번호 로그인을 유지하거나 테스트 생체인증 확인으로 로그인할 수 있습니다.",
-      })
-    } catch {
-      setBiometricLoginModal({
-        supported: false,
-        title: "생체인증 센서 미지원 환경",
-        message:
-          "생체인증 하드웨어를 사용할 수 없는 환경입니다. 일반 로그인을 이용해 주세요.",
-      })
-    }
   }
 
   return (
@@ -3044,6 +3059,7 @@ function Auth({
                 onChange={(event) => setLoginPassword(event.target.value)}
               />
               <button
+                type="button"
                 className="field__button"
                 onClick={() => setShowPassword(!showPassword)}
                 aria-label="비밀번호 표시 전환"
@@ -3056,7 +3072,11 @@ function Auth({
             <input type="checkbox" defaultChecked /> 로그인 상태 유지
           </label>
           {authError && <span className="field-error">{authError}</span>}
-          <Button onClick={() => handleLogin("rider")} disabled={authLoading}>
+          <Button
+            type="button"
+            onClick={() => handleLogin("rider")}
+            disabled={authLoading}
+          >
             {authLoading ? "로그인 중..." : "로그인"}
           </Button>
           {isBiometricLoginEnabled && (
@@ -3070,13 +3090,32 @@ function Auth({
               <ShieldCheck /> 생체인증 로그인 (지문 / Face ID)
             </Button>
           )}
-          <button className="login-link" onClick={() => setView("reset")}>
+          <button
+            type="button"
+            className="login-link"
+            onClick={() => {
+              setAuthError("")
+              setResetInlineError("")
+              setResetVerified(false)
+              setFoundMember(null)
+              setView("reset")
+            }}
+          >
             비밀번호를 잊으셨나요?
           </button>
         </div>
         <p className="join">
           처음이신가요?{" "}
-          <button onClick={() => setView("signup")}>신구길 가입하기</button>
+          <button
+            type="button"
+            onClick={() => {
+              setAuthError("")
+              setStep(1)
+              setView("signup")
+            }}
+          >
+            신구길 가입하기
+          </button>
         </p>
       </div>
       <p className="demo-note">
@@ -6257,14 +6296,15 @@ function SheetView({
     smokingPreference: route.smokingPreference ?? "비흡연자 선호",
     genderPreference: route.genderPreference ?? "성별 무관",
   })
-  const [createDatePickerOpen, setCreateDatePickerOpen] = useState(false)
-  const [createTimePickerOpen, setCreateTimePickerOpen] = useState(false)
-  const [routeDeparturePickerOpen, setRouteDeparturePickerOpen] =
-    useState(false)
-  const [routeArrivalPickerOpen, setRouteArrivalPickerOpen] = useState(false)
+  const [activeSheetPicker, setActiveSheetPicker] = useState<
+    "none" | "create-date" | "create-time" | "route-departure" | "route-arrival"
+  >("none")
   const [routeTimeAlert, setRouteTimeAlert] = useState("")
   const [routeTimeAutoNotice, setRouteTimeAutoNotice] = useState("")
   const [createError, setCreateError] = useState("")
+  useEffect(() => {
+    setActiveSheetPicker("none")
+  }, [type])
   useEffect(() => {
     setRouteDraft(route)
     setCreateDraft((prev) => ({
@@ -7395,7 +7435,7 @@ function SheetView({
               <button
                 type="button"
                 className="field__control custom-picker-trigger"
-                onClick={() => setCreateDatePickerOpen(true)}
+                onClick={() => setActiveSheetPicker("create-date")}
               >
                 <CalendarDays />
                 <span>
@@ -7410,7 +7450,7 @@ function SheetView({
               <button
                 type="button"
                 className="field__control custom-picker-trigger"
-                onClick={() => setCreateTimePickerOpen(true)}
+                onClick={() => setActiveSheetPicker("create-time")}
               >
                 <Clock3 />
                 <span>
@@ -7418,24 +7458,30 @@ function SheetView({
                 </span>
               </button>
             </div>
-            <CustomDatePickerModal
-              isOpen={createDatePickerOpen}
-              value={createDraft.date || getTodayDateKey()}
-              title="운행 날짜 선택"
-              onClose={() => setCreateDatePickerOpen(false)}
-              onConfirm={(selectedDateKey) =>
-                setCreateDraft((prev) => ({ ...prev, date: selectedDateKey }))
-              }
-            />
-            <CustomTimePickerModal
-              isOpen={createTimePickerOpen}
-              value={createDraft.time || "08:30"}
-              title="출발 시간 선택"
-              onClose={() => setCreateTimePickerOpen(false)}
-              onConfirm={(nextTime) =>
-                setCreateDraft((prev) => ({ ...prev, time: nextTime }))
-              }
-            />
+            {activeSheetPicker === "create-date" && (
+              <CustomDatePickerModal
+                isOpen={true}
+                value={createDraft.date || getTodayDateKey()}
+                title="운행 날짜 선택"
+                onClose={() => setActiveSheetPicker("none")}
+                onConfirm={(selectedDateKey) => {
+                  setCreateDraft((prev) => ({ ...prev, date: selectedDateKey }))
+                  setActiveSheetPicker("none")
+                }}
+              />
+            )}
+            {activeSheetPicker === "create-time" && (
+              <CustomTimePickerModal
+                isOpen={true}
+                value={createDraft.time || "08:30"}
+                title="출발 시간 선택"
+                onClose={() => setActiveSheetPicker("none")}
+                onConfirm={(nextTime) => {
+                  setCreateDraft((prev) => ({ ...prev, time: nextTime }))
+                  setActiveSheetPicker("none")
+                }}
+              />
+            )}
             <Field
               label="출발 장소 *"
               value={createDraft.start}
@@ -9033,7 +9079,7 @@ function SheetView({
               <button
                 type="button"
                 className="field__control custom-picker-trigger"
-                onClick={() => setRouteDeparturePickerOpen(true)}
+                onClick={() => setActiveSheetPicker("route-departure")}
               >
                 <Clock3 />
                 <span>
@@ -9047,7 +9093,7 @@ function SheetView({
               <button
                 type="button"
                 className="field__control custom-picker-trigger"
-                onClick={() => setRouteArrivalPickerOpen(true)}
+                onClick={() => setActiveSheetPicker("route-arrival")}
               >
                 <Navigation />
                 <span>
@@ -9071,68 +9117,74 @@ function SheetView({
                 <span>{routeTimeAutoNotice}</span>
               </div>
             )}
-            <CustomTimePickerModal
-              isOpen={routeDeparturePickerOpen}
-              value={routeDraft.departureTime || "08:30"}
-              maxTime24="23:58"
-              title="희망 출발 시간 설정"
-              subtitle="출발 시간이 도착 시간과 같거나 늦으면 도착 시간이 자동으로 이후 시간대로 조정됩니다."
-              onClose={() => setRouteDeparturePickerOpen(false)}
-              onConfirm={(nextTime) => {
-                const resolved = resolveValidArrivalTime24(
-                  nextTime,
-                  routeDraft.preferredArrival,
-                )
-                const nextDraft: RouteData = {
-                  ...routeDraft,
-                  departureTime: resolved.departure24,
-                  preferredArrival: resolved.arrival24,
-                }
-                if (resolved.autoAdjusted) {
-                  setRouteTimeAutoNotice(
-                    `출발 시간이 변경되어 도착 시간이 ${formatKoreanTimeLabel(resolved.arrival24)}(${resolved.arrival24})으로 자동 조정되었습니다.`,
-                  )
-                } else {
-                  setRouteTimeAutoNotice("")
-                }
-                setRouteDraft(nextDraft)
-                setRouteDirty(true)
-                onSaveRoute(nextDraft)
-              }}
-            />
-            <CustomTimePickerModal
-              isOpen={routeArrivalPickerOpen}
-              value={
-                routeDraft.preferredArrival ||
-                resolveValidArrivalTime24(routeDraft.departureTime || "08:30")
-                  .arrival24
-              }
-              minTime24={routeDraft.departureTime || "08:30"}
-              title="희망 도착 시간 설정"
-              subtitle={`현재 출발 시간(${formatKoreanTimeLabel(routeDraft.departureTime || "08:30")} · ${routeDraft.departureTime || "08:30"})보다 이후 시간만 선택할 수 있습니다.`}
-              onClose={() => setRouteArrivalPickerOpen(false)}
-              onConfirm={(nextTime) => {
-                if (
-                  !isValidDepartureAndArrival(
-                    routeDraft.departureTime || "08:30",
+            {activeSheetPicker === "route-departure" && (
+              <CustomTimePickerModal
+                isOpen={true}
+                value={routeDraft.departureTime || "08:30"}
+                maxTime24="23:58"
+                title="희망 출발 시간 설정"
+                subtitle="출발 시간이 도착 시간과 같거나 늦으면 도착 시간이 자동으로 이후 시간대로 조정됩니다."
+                onClose={() => setActiveSheetPicker("none")}
+                onConfirm={(nextTime) => {
+                  const resolved = resolveValidArrivalTime24(
                     nextTime,
+                    routeDraft.preferredArrival,
                   )
-                ) {
-                  setRouteTimeAlert(
-                    "도착 시간은 출발 시간보다 이후로 설정해주세요.",
-                  )
-                  return
+                  const nextDraft: RouteData = {
+                    ...routeDraft,
+                    departureTime: resolved.departure24,
+                    preferredArrival: resolved.arrival24,
+                  }
+                  if (resolved.autoAdjusted) {
+                    setRouteTimeAutoNotice(
+                      `출발 시간이 변경되어 도착 시간이 ${formatKoreanTimeLabel(resolved.arrival24)}(${resolved.arrival24})으로 자동 조정되었습니다.`,
+                    )
+                  } else {
+                    setRouteTimeAutoNotice("")
+                  }
+                  setRouteDraft(nextDraft)
+                  setRouteDirty(true)
+                  onSaveRoute(nextDraft)
+                  setActiveSheetPicker("none")
+                }}
+              />
+            )}
+            {activeSheetPicker === "route-arrival" && (
+              <CustomTimePickerModal
+                isOpen={true}
+                value={
+                  routeDraft.preferredArrival ||
+                  resolveValidArrivalTime24(routeDraft.departureTime || "08:30")
+                    .arrival24
                 }
-                const nextDraft: RouteData = {
-                  ...routeDraft,
-                  preferredArrival: nextTime,
-                }
-                setRouteTimeAutoNotice("")
-                setRouteDraft(nextDraft)
-                setRouteDirty(true)
-                onSaveRoute(nextDraft)
-              }}
-            />
+                minTime24={routeDraft.departureTime || "08:30"}
+                title="희망 도착 시간 설정"
+                subtitle={`현재 출발 시간(${formatKoreanTimeLabel(routeDraft.departureTime || "08:30")} · ${routeDraft.departureTime || "08:30"})보다 이후 시간만 선택할 수 있습니다.`}
+                onClose={() => setActiveSheetPicker("none")}
+                onConfirm={(nextTime) => {
+                  if (
+                    !isValidDepartureAndArrival(
+                      routeDraft.departureTime || "08:30",
+                      nextTime,
+                    )
+                  ) {
+                    setRouteTimeAlert(
+                      "도착 시간은 출발 시간보다 이후로 설정해주세요.",
+                    )
+                    return
+                  }
+                  const nextDraft: RouteData = {
+                    ...routeDraft,
+                    preferredArrival: nextTime,
+                  }
+                  setRouteTimeAutoNotice("")
+                  setRouteDraft(nextDraft)
+                  setRouteDirty(true)
+                  onSaveRoute(nextDraft)
+                  setActiveSheetPicker("none")
+                }}
+              />
+            )}
             {role === "rider" && (
               <div className="two-fields">
                 <label className="field">
@@ -11124,8 +11176,9 @@ export default function App() {
     const today = getTodayDateKey()
     return saved && saved >= today ? saved : today
   })
-  const [homeDatePickerOpen, setHomeDatePickerOpen] = useState(false)
-  const [homeTimePickerOpen, setHomeTimePickerOpen] = useState(false)
+  const [activeModal, setActiveModal] = useState<
+    "none" | "date" | "time" | "route"
+  >("none")
   const [homeTimePickerField, setHomeTimePickerField] =
     useState<"departure" | "arrival">("departure")
   const [viewingUserProfile, setViewingUserProfile] =
@@ -11135,6 +11188,40 @@ export default function App() {
     message: string
     requireLogin?: boolean
   } | null>(null)
+
+  const closeAllModals = () => {
+    setActiveModal("none")
+    setSheet(null)
+  }
+
+  const handleOpenSheet = (nextSheet: Sheet) => {
+    setViewingUserProfile(null)
+    if (!nextSheet) {
+      setActiveModal("none")
+      setSheet(null)
+      return
+    }
+    if (nextSheet === "route-edit") {
+      setActiveModal("route")
+      setSheet("route-edit")
+      return
+    }
+    setActiveModal("none")
+    setSheet(nextSheet)
+  }
+
+  const handleOpenDatePicker = () => {
+    setSheet(null)
+    setViewingUserProfile(null)
+    setActiveModal("date")
+  }
+
+  const handleOpenTimePicker = (field: "departure" | "arrival" = "departure") => {
+    setSheet(null)
+    setViewingUserProfile(null)
+    setHomeTimePickerField(field)
+    setActiveModal("time")
+  }
 
   // Supabase 세션 감지 및 profiles 테이블 Realtime 양방향 동기화
   useEffect(() => {
@@ -11232,6 +11319,9 @@ export default function App() {
   const openUserProfile = (target: PublicUserProfileTarget) => {
     const resolved = resolvePublicUserProfile(target, carpoolFlow, account)
     if (resolved) {
+      setActiveModal((prev) =>
+        prev === "date" || prev === "time" ? "none" : prev,
+      )
       setViewingUserProfile(resolved)
     }
   }
@@ -11369,7 +11459,7 @@ export default function App() {
 
   const activateRole = async (next: Role, confirmSchedule = true) => {
     if (next === role) {
-      setSheet(null)
+      closeAllModals()
       return
     }
     if (confirmSchedule) {
@@ -11395,16 +11485,16 @@ export default function App() {
       return updatedAccount
     })
     setTab("home")
-    setSheet(null)
+    closeAllModals()
   }
 
   const requestRole = (next: Role) => {
     if (next === role) {
-      setSheet(null)
+      closeAllModals()
       return
     }
     if (!safeRegistrations[next]) {
-      setSheet(next === "driver" ? "driver-register" : "rider-register")
+      handleOpenSheet(next === "driver" ? "driver-register" : "rider-register")
       return
     }
     activateRole(next)
@@ -11436,7 +11526,7 @@ export default function App() {
       return (
         <SchedulePage
           role={role}
-          open={setSheet}
+          open={handleOpenSheet}
           carpoolFlow={carpoolFlow}
           onViewUserProfile={openUserProfile}
           account={account}
@@ -11467,7 +11557,7 @@ export default function App() {
           route={routesByRole[role]}
           account={account}
           selectedBadges={selectedBadges}
-          open={setSheet}
+          open={handleOpenSheet}
           logout={() => {
             if (isSupabaseConfigured()) {
               supabaseSignOut().catch(console.warn)
@@ -11483,14 +11573,11 @@ export default function App() {
       )
     return role === "driver" ? (
       <DriverHome
-        open={setSheet}
+        open={handleOpenSheet}
         route={routesByRole.driver}
         bookingDate={bookingDate}
-        onOpenDatePicker={() => setHomeDatePickerOpen(true)}
-        onOpenTimePicker={(field = "departure") => {
-          setHomeTimePickerField(field)
-          setHomeTimePickerOpen(true)
-        }}
+        onOpenDatePicker={handleOpenDatePicker}
+        onOpenTimePicker={handleOpenTimePicker}
         account={account}
         tripFlow={tripFlow}
         onStartTrip={startDemoTrip}
@@ -11499,6 +11586,7 @@ export default function App() {
         carpoolFlow={carpoolFlow}
         mileageBalance={mileageBalance}
         onOpenChat={(rideId) => {
+          closeAllModals()
           setChatTargetRideId(rideId)
           setTab("chat")
         }}
@@ -11506,24 +11594,22 @@ export default function App() {
       />
     ) : (
       <RiderHome
-        open={setSheet}
+        open={handleOpenSheet}
         account={account}
         route={routesByRole.rider}
         bookingDate={bookingDate}
-        onOpenDatePicker={() => setHomeDatePickerOpen(true)}
-        onOpenTimePicker={(field = "departure") => {
-          setHomeTimePickerField(field)
-          setHomeTimePickerOpen(true)
-        }}
+        onOpenDatePicker={handleOpenDatePicker}
+        onOpenTimePicker={handleOpenTimePicker}
         tripFlow={tripFlow}
         carpoolFlow={carpoolFlow}
         onOpenChat={(rideId) => {
+          closeAllModals()
           setChatTargetRideId(rideId)
           setTab("chat")
         }}
         onSelectRide={(ride) => {
           setSelectedRide(ride)
-          setSheet("ride")
+          handleOpenSheet("ride")
         }}
         onViewUserProfile={openUserProfile}
       />
@@ -11651,6 +11737,7 @@ export default function App() {
             writeDemoData("role-registrations", updated)
           }}
         />
+        <GlobalDialog />
       </div>
     )
 
@@ -11659,8 +11746,8 @@ export default function App() {
       {tab !== "chat" && (
         <Header
           role={role}
-          onRole={() => setSheet("roles")}
-          onBell={() => setSheet("notifications")}
+          onRole={() => handleOpenSheet("roles")}
+          onBell={() => handleOpenSheet("notifications")}
         />
       )}
       <main className="app-content">{page}</main>
@@ -11672,7 +11759,7 @@ export default function App() {
             className="payment-global-banner"
             onClick={() => {
               setTab("home")
-              setSheet("carpool-payment")
+              handleOpenSheet("carpool-payment")
             }}
           >
             <WalletCards />
@@ -11683,36 +11770,53 @@ export default function App() {
             <ChevronRight />
           </button>
         )}
-      <BottomNav tab={tab} setTab={setTab} />
-      <CustomDatePickerModal
-        isOpen={homeDatePickerOpen}
-        value={bookingDate}
-        title="원하는 날짜 예약"
-        onClose={() => setHomeDatePickerOpen(false)}
-        onConfirm={(nextDateKey) => handleGlobalDateChange(nextDateKey)}
+      <BottomNav
+        tab={tab}
+        setTab={(nextTab) => {
+          closeAllModals()
+          setTab(nextTab)
+        }}
       />
-      <CustomTimePickerModal
-        isOpen={homeTimePickerOpen}
-        value={routesByRole[role].departureTime || "08:30"}
-        arrivalValue={
-          routesByRole[role].preferredArrival ||
-          resolveValidArrivalTime24(routesByRole[role].departureTime || "08:30")
-            .arrival24
-        }
-        initialField={homeTimePickerField}
-        title="출발 · 희망 도착 시간 설정"
-        subtitle="출발 시간과 희망 도착 시간을 설정하면 기본 경로, 예약 내역, 상세 카드 등 모든 시간 데이터가 실시간 동기화됩니다."
-        onClose={() => setHomeTimePickerOpen(false)}
-        onConfirm={(nextTime24) => handleGlobalTimeChange(nextTime24)}
-        onConfirmRange={(nextDep24, nextArr24) =>
-          handleGlobalTimeChange(nextDep24, nextArr24)
-        }
-      />
-      {sheet && (
+      {activeModal === "date" && (
+        <CustomDatePickerModal
+          isOpen={true}
+          value={bookingDate}
+          title="원하는 날짜 예약"
+          onClose={closeAllModals}
+          onConfirm={(nextDateKey) => {
+            handleGlobalDateChange(nextDateKey)
+            closeAllModals()
+          }}
+        />
+      )}
+      {activeModal === "time" && (
+        <CustomTimePickerModal
+          isOpen={true}
+          value={routesByRole[role].departureTime || "08:30"}
+          arrivalValue={
+            routesByRole[role].preferredArrival ||
+            resolveValidArrivalTime24(routesByRole[role].departureTime || "08:30")
+              .arrival24
+          }
+          initialField={homeTimePickerField}
+          title="출발 · 희망 도착 시간 설정"
+          subtitle="출발 시간과 희망 도착 시간을 설정하면 기본 경로, 예약 내역, 상세 카드 등 모든 시간 데이터가 실시간 동기화됩니다."
+          onClose={closeAllModals}
+          onConfirm={(nextTime24) => {
+            handleGlobalTimeChange(nextTime24)
+            closeAllModals()
+          }}
+          onConfirmRange={(nextDep24, nextArr24) => {
+            handleGlobalTimeChange(nextDep24, nextArr24)
+            closeAllModals()
+          }}
+        />
+      )}
+      {activeModal !== "date" && activeModal !== "time" && sheet && (
         <SheetView
           type={sheet}
-          close={() => setSheet(null)}
-          open={setSheet}
+          close={closeAllModals}
+          open={handleOpenSheet}
           role={role}
           route={routesByRole[role]}
           account={account}
@@ -11805,7 +11909,7 @@ export default function App() {
           }}
           onCompletePayment={completeDemoPayment}
           onGoHome={() => {
-            setSheet(null)
+            closeAllModals()
             setTab("home")
           }}
           onViewUserProfile={openUserProfile}

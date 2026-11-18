@@ -715,7 +715,8 @@ h3 { font-size: 16px; }
 .driver-payment-status span { color: #c4d0d8; font-size: 9px; }.driver-payment-status strong { color: var(--white); font-size: 10px; }
 .driver-payment-status p { margin-top: 5px; color: #d5dee4; font-size: 8px; line-height: 1.5; }
 .driver-payment-status button { margin-top: 7px; padding: 0; border: 0; background: transparent; color: #c8ddba; font-size: 8px; font-weight: 700; }
-.flow-dialog-backdrop { position: fixed; z-index: 70; left: 50%; width: min(100%,430px); transform: translateX(-50%); }
+.flow-dialog-backdrop { position: fixed; inset: 0; z-index: 70; left: 0; right: 0; width: 100%; transform: none; display: flex; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
+.flow-dialog-backdrop > .app-dialog { width: 90%; max-width: 380px; margin: 0 auto; box-sizing: border-box; }
 .payment-request-section { padding-top: 17px; }
 .payment-request-card { padding: 17px; border: 1px solid #dfe9da; border-radius: 20px; background: var(--white); box-shadow: 0 10px 24px rgba(23,54,83,.08); }
 .payment-request-heading { display: flex; align-items: center; gap: 10px; }
@@ -2050,5 +2051,57 @@ h3 { font-size: 16px; }
 .custom-picker-backdrop {
   position: fixed !important;
   inset: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  max-width: none !important;
+  transform: none !important;
   z-index: 99990 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 16px !important;
+  box-sizing: border-box !important;
+}
+
+.custom-calendar-dialog,
+.custom-time-dialog {
+  width: 90% !important;
+  max-width: 380px !important;
+  max-height: 88dvh !important;
+  margin: 0 auto !important;
+  overflow-y: auto !important;
+  padding: 20px 18px !important;
+  border-radius: 24px !important;
+  background: var(--ivory) !important;
+  text-align: left !important;
+  box-sizing: border-box !important;
+  animation: reset-slide-down 0.22s ease-out forwards;
+}
+
+.time-validation-alert-backdrop {
+  position: fixed !important;
+  inset: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  max-width: none !important;
+  transform: none !important;
+  z-index: 99995 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 16px !important;
+  box-sizing: border-box !important;
+}
+
+.time-validation-alert-backdrop > .app-dialog {
+  width: 90% !important;
+  max-width: 380px !important;
+  margin: 0 auto !important;
+  box-sizing: border-box !important;
 }
