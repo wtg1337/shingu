@@ -132,13 +132,36 @@ function isStateValid(value: unknown): value is DemoCarpoolState {
   )
 }
 
+const LEGACY_SAMPLE_NAMES = new Set([
+  "김민준",
+  "박지훈",
+  "한소희",
+  "최유진",
+  "이서연",
+  "정우진",
+])
+
 function readState(): DemoCarpoolState {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")
     if (!isStateValid(parsed)) return EMPTY_STATE
+    const cleanRides = parsed.rides.filter(
+      (ride) =>
+        ride.driverId !== "demo-driver" &&
+        !LEGACY_SAMPLE_NAMES.has((ride.driverName || "").trim()),
+    )
+    const validRideIds = new Set(cleanRides.map((r) => r.id))
+    const cleanApplications = parsed.applications.filter(
+      (app) =>
+        validRideIds.has(app.rideId) &&
+        app.riderId !== "demo-rider" &&
+        !LEGACY_SAMPLE_NAMES.has((app.riderName || "").trim()),
+    )
+    const cleanReviews = parsed.reviews.filter((rev) =>
+      validRideIds.has(rev.rideId),
+    )
     return {
-      ...parsed,
-      rides: parsed.rides.map((ride) => {
+      rides: cleanRides.map((ride) => {
         const estimatedDuration =
           Number.isSafeInteger(ride.estimatedDuration) &&
           ride.estimatedDuration > 0
@@ -160,6 +183,8 @@ function readState(): DemoCarpoolState {
           arrivalTimeManual: ride.arrivalTimeManual === true,
         }
       }),
+      applications: cleanApplications,
+      reviews: cleanReviews,
       events: Array.isArray(parsed.events) ? parsed.events : [],
     }
   } catch {
@@ -174,6 +199,15 @@ function save(next: DemoCarpoolState) {
   snapshot = next
   localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
   listeners.forEach((listener) => listener())
+}
+
+export function resetCarpoolFlow() {
+  save({
+    rides: [],
+    applications: [],
+    reviews: [],
+    events: [],
+  })
 }
 
 const createId = (prefix: string) =>

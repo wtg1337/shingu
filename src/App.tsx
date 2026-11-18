@@ -87,6 +87,7 @@ import {
 import {
   chargeDemoPoints,
   getDemoPointWallet,
+  resetDemoPoints,
   subscribeDemoPointWallet,
   type DemoPaymentMethod,
   type DemoPointCharge,
@@ -101,6 +102,7 @@ import {
   endCarpoolRide,
   getCarpoolFlowSnapshot,
   getRemainingSeats,
+  resetCarpoolFlow,
   settleCarpoolRide,
   subscribeCarpoolFlow,
   updateCarpoolRidesTimeAndDate,
@@ -328,17 +330,13 @@ const getVisibleMatchRides = (
 type Sheet = "ride" | "matches" | "create" | "reservation" | "notifications" | "points" | "mileage" | "mileage-history" | "history" | "carpool-payment" | "safety" | "safety-report" | "blocked-users" | "report-history" | "privacy" | "privacy-policy" | "roles" | "driver-register" | "rider-register" | "settings" | "notification-settings" | "security-settings" | "service-guide" | "passenger-guide" | "driver-guide" | "contact-support" | "route-edit" | "applications" | "application-detail" | "calendar" | "account" | "account-edit" | "monthly-rides" | "review" | "reviews" | null
 
 function normalizeRegistrations(
-  value: unknown,
-  currentRole: Role = "rider",
+  _value: unknown,
+  _currentRole: Role = "rider",
 ): RoleRegistrations {
-  if (!value || typeof value !== "object") {
-    return { rider: currentRole === "rider", driver: currentRole === "driver" }
-  }
-
-  const stored = value as Partial<RoleRegistrations>
+  // 회원가입한 단일 사용자 계정으로 운전자 ↔ 탑승자 역할이 즉시 전환되도록 두 역할 모두 활성화 유지
   return {
-    rider: stored.rider === true || currentRole === "rider",
-    driver: stored.driver === true || currentRole === "driver",
+    rider: true,
+    driver: true,
   }
 }
 
@@ -1990,7 +1988,12 @@ function Auth({
         })
         return
       }
-      onLogin(targetRole)
+      onLogin(targetRole, {
+        id: trimmedLoginId,
+        loginId: trimmedLoginId,
+        name: trimmedLoginId,
+        email,
+      })
     } catch (err) {
       const msg = err instanceof Error ? err.message : "로그인에 실패했습니다."
       setAuthError(
@@ -3968,10 +3971,14 @@ function DriverHome({
           <span>오늘의 운행</span>
           <span
             className={`tag ${
-              tripFlow.status === "결제 대기" ? "waiting" : "open"
+              newestRide
+                ? tripFlow.status === "결제 대기"
+                  ? "waiting"
+                  : "open"
+                : "waiting"
             }`}
           >
-            {tripFlow.status}
+            {newestRide ? newestRide.status : "예정된 운행 없음"}
           </span>
         </div>
         <h2>{formatKoreanTimeLabel(route.departureTime)} 출발</h2>
@@ -5546,26 +5553,41 @@ function ProfilePage({
   mileageBalance: number
   carpoolFlow: DemoCarpoolState
 }) {
-  const flowReviews: DemoReview[] = carpoolFlow.reviews.map((review) => ({
-    author: "탑승자 리뷰",
-    date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
-    score: review.rating,
-    text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
-    tags: review.keywords,
-  }))
-  const userReceivedReviews = readDemoList<DemoReview>(`received-reviews-${account.id || account.loginId || "user"}`)
-  const legacyReceivedReviews = readDemoList<DemoReview>("received-reviews")
-  const profileReviews = [
-    ...flowReviews,
-    ...userReceivedReviews,
-    ...legacyReceivedReviews,
-  ]
+  const userReviewStorageKey = `received-reviews-${account.id || account.loginId || "user"}`
+  const flowReviews: DemoReview[] = carpoolFlow.reviews
+    .filter((review) => {
+      if (!account.id && !account.loginId && !account.name) return false
+      if (
+        (account.id && review.targetId === account.id) ||
+        (account.loginId && review.targetId === account.loginId)
+      ) {
+        return true
+      }
+      const targetRide = carpoolFlow.rides.find((r) => r.id === review.rideId)
+      return Boolean(
+        targetRide &&
+          ((account.id && targetRide.driverId === account.id) ||
+            (account.loginId && targetRide.driverId === account.loginId) ||
+            (account.name && targetRide.driverName === account.name)),
+      )
+    })
+    .map((review) => ({
+      author: "탑승자 리뷰",
+      date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
+      score: Number.isFinite(review.rating) ? review.rating : 0,
+      text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
+      tags: Array.isArray(review.keywords) ? review.keywords : [],
+    }))
+  const userReceivedReviews = readDemoList<DemoReview>(userReviewStorageKey)
+  const profileReviews = [...flowReviews, ...userReceivedReviews]
   const reviewCount = profileReviews.length
   const averageRating =
     reviewCount > 0
       ? (
-          profileReviews.reduce((sum, item) => sum + item.score, 0) /
-          reviewCount
+          profileReviews.reduce(
+            (sum, item) => sum + (Number(item?.score) || 0),
+            0,
+          ) / reviewCount
         ).toFixed(1)
       : "0.0"
 
@@ -6121,9 +6143,10 @@ function SheetView({
   const [reviewed, setReviewed] = useState(
     () => readDemoValue("review-ride-0516") === "true",
   )
+  const sheetReviewStorageKey = `received-reviews-${account.id || account.loginId || "user"}`
   const [reviewText, setReviewText] = useState("")
   const [savedReviews, setSavedReviews] = useState<DemoReview[]>(() =>
-    readDemoList<DemoReview>("received-reviews"),
+    readDemoList<DemoReview>(sheetReviewStorageKey),
   )
   const [rating, setRating] = useState(0)
   const [applicationFilter, setApplicationFilter] = useState("전체")
@@ -6423,6 +6446,35 @@ function SheetView({
   const filteredMileageHistoryEntries = mileageHistoryEntries.filter(
     (entry) => historyFilter === "전체" || (entry.type as string) === historyFilter,
   )
+  const flowSheetReviews: DemoReview[] = carpoolFlow.reviews
+    .filter((review) => {
+      if (!account.id && !account.loginId && !account.name) return false
+      if (
+        (account.id && review.targetId === account.id) ||
+        (account.loginId && review.targetId === account.loginId)
+      ) {
+        return true
+      }
+      const targetRide = carpoolFlow.rides.find((r) => r.id === review.rideId)
+      return Boolean(
+        targetRide &&
+          ((account.id && targetRide.driverId === account.id) ||
+            (account.loginId && targetRide.driverId === account.loginId) ||
+            (account.name && targetRide.driverName === account.name)),
+      )
+    })
+    .map((review) => ({
+      author: "탑승자 리뷰",
+      date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
+      score: Number.isFinite(review.rating) ? review.rating : 0,
+      text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
+      tags: Array.isArray(review.keywords) ? review.keywords : [],
+    }))
+  const allReviews = [
+    ...flowSheetReviews,
+    ...savedReviews,
+    ...demoReceivedReviews,
+  ]
   const titles: Record<Exclude<Sheet, null>, string> = {
     ride: "카풀 상세",
     matches: "SMART MATCH 추천",
@@ -6463,11 +6515,7 @@ function SheetView({
     "account-edit": "정보 수정",
     "monthly-rides": "이번 달 운행 내역",
     review: "후기 작성",
-    reviews: `받은 후기 (${
-      demoReceivedReviews.length +
-      savedReviews.length +
-      carpoolFlow.reviews.length
-    })`,
+    reviews: `받은 후기 (${allReviews.length})`,
   }
   const requestClose = async () => {
     if (type === "route-edit" && routeDirty) {
@@ -6482,18 +6530,6 @@ function SheetView({
     }
     close()
   }
-  const flowSheetReviews: DemoReview[] = carpoolFlow.reviews.map((review) => ({
-    author: review.riderName || "탑승자 리뷰",
-    date: new Date(review.createdAt).toLocaleDateString("ko-KR"),
-    score: review.rating,
-    text: review.content || "후기 내용 없이 매너 키워드만 남겼어요.",
-    tags: review.keywords,
-  }))
-  const allReviews = [
-    ...flowSheetReviews,
-    ...savedReviews,
-    ...demoReceivedReviews,
-  ]
   const reviewRide = carpoolFlow.rides.find(
     (ride) =>
       ride.status === "완료" &&
@@ -6674,7 +6710,14 @@ function SheetView({
     2,
     "0",
   )}-${selectedDate.padStart(2, "0")}`
-  const selectedCalendarRides = carpoolFlow.rides.filter(
+  const userCalendarRides = carpoolFlow.rides.filter((ride) =>
+    role === "driver"
+      ? isMyDriverRide(ride)
+      : carpoolFlow.applications.some(
+          (app) => app.rideId === ride.id && isMyApplication(app),
+        ),
+  )
+  const selectedCalendarRides = userCalendarRides.filter(
     (ride) => ride.date === selectedCalendarKey,
   )
   const isRideApplied = (ride: MatchRide) =>
@@ -8846,7 +8889,7 @@ function SheetView({
                 const hasRide =
                   visible &&
                   (Boolean(demoScheduleByDate[dateKey]?.length) ||
-                    carpoolFlow.rides.some((ride) => ride.date === dateKey))
+                    userCalendarRides.some((ride) => ride.date === dateKey))
                 return (
                   <button
                     className={`${selectedDate === value ? "selected" : ""} ${
@@ -9537,7 +9580,7 @@ function SheetView({
                     }
                     const nextReviews = [review, ...savedReviews]
                     setSavedReviews(nextReviews)
-                    writeDemoData("received-reviews", nextReviews)
+                    writeDemoData(sheetReviewStorageKey, nextReviews)
                   }
                   setFlowNotice("후기 작성 완료")
                 } catch (error) {
@@ -11555,7 +11598,28 @@ export default function App() {
               setRoutesByRole(defaultRoutes)
               writeDemoData("routes", defaultRoutes)
               writeDemoData("received-reviews", [])
+              writeDemoData(
+                `received-reviews-${mergedAccount.id || "user"}`,
+                [],
+              )
+              if (mergedAccount.loginId) {
+                writeDemoData(`received-reviews-${mergedAccount.loginId}`, [])
+              }
+              resetCarpoolFlow()
+              resetDemoPoints()
               resetDemoTrip()
+              try {
+                localStorage.setItem(
+                  `shingu-mileage-balance-${mergedAccount.id}-driver`,
+                  "0",
+                )
+                localStorage.setItem(
+                  `shingu-mileage-balance-${mergedAccount.id}-rider`,
+                  "0",
+                )
+              } catch {
+                // ignore storage error
+              }
               const freshBadges: Record<Role, string[]> = {
                 rider: [],
                 driver: mergedAccount.isDriverVerified

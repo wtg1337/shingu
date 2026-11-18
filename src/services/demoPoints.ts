@@ -69,6 +69,10 @@ export function getDemoPointWallet() {
   return snapshot
 }
 
+export function resetDemoPoints() {
+  publish({ balance: 0, charges: [] })
+}
+
 export function subscribeDemoPointWallet(listener: () => void) {
   listeners.add(listener)
   return () => listeners.delete(listener)
