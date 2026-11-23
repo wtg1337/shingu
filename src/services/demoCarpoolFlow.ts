@@ -3,6 +3,11 @@ import {
   DEFAULT_ESTIMATED_DURATION,
 } from "./demoEta"
 import {
+  DIRECT_ROUTE_LABEL,
+  fetchRouteWaypointsFromMapBackend,
+  getExtractedWaypointsSync,
+} from "./routeWaypointService"
+import {
   supabaseGetRides,
   supabaseCreateRide,
   supabaseUpdateRideStatus,
@@ -30,6 +35,7 @@ export type DemoCarpoolRide = {
   price: number
   note: string
   waypoints: string
+  waypointsList?: string[]
   estimatedDuration: number
   estimatedArrival: string
   arrivalTimeManual: boolean
@@ -126,21 +132,50 @@ function isStateValid(value: unknown): value is DemoCarpoolState {
   )
 }
 
+const LEGACY_SAMPLE_NAMES = new Set([
+  "김민준",
+  "박지훈",
+  "한소희",
+  "최유진",
+  "이서연",
+  "정우진",
+])
+
 function readState(): DemoCarpoolState {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")
     if (!isStateValid(parsed)) return EMPTY_STATE
+    const cleanRides = parsed.rides.filter(
+      (ride) =>
+        ride.driverId !== "demo-driver" &&
+        !LEGACY_SAMPLE_NAMES.has((ride.driverName || "").trim()),
+    )
+    const validRideIds = new Set(cleanRides.map((r) => r.id))
+    const cleanApplications = parsed.applications.filter(
+      (app) =>
+        validRideIds.has(app.rideId) &&
+        app.riderId !== "demo-rider" &&
+        !LEGACY_SAMPLE_NAMES.has((app.riderName || "").trim()),
+    )
+    const cleanReviews = parsed.reviews.filter((rev) =>
+      validRideIds.has(rev.rideId),
+    )
     return {
-      ...parsed,
-      rides: parsed.rides.map((ride) => {
+      rides: cleanRides.map((ride) => {
         const estimatedDuration =
           Number.isSafeInteger(ride.estimatedDuration) &&
           ride.estimatedDuration > 0
             ? ride.estimatedDuration
             : DEFAULT_ESTIMATED_DURATION
+        const extracted = getExtractedWaypointsSync(
+          ride.start,
+          ride.destination,
+          ride.waypointsList ?? ride.waypoints ?? ride.note ?? "",
+        )
         return {
           ...ride,
-          waypoints: ride.waypoints ?? ride.note ?? "",
+          waypoints: extracted.formatted || DIRECT_ROUTE_LABEL,
+          waypointsList: extracted.waypointsList,
           estimatedDuration,
           estimatedArrival:
             ride.estimatedArrival ||
@@ -148,6 +183,8 @@ function readState(): DemoCarpoolState {
           arrivalTimeManual: ride.arrivalTimeManual === true,
         }
       }),
+      applications: cleanApplications,
+      reviews: cleanReviews,
       events: Array.isArray(parsed.events) ? parsed.events : [],
     }
   } catch {
@@ -162,6 +199,15 @@ function save(next: DemoCarpoolState) {
   snapshot = next
   localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
   listeners.forEach((listener) => listener())
+}
+
+export function resetCarpoolFlow() {
+  save({
+    rides: [],
+    applications: [],
+    reviews: [],
+    events: [],
+  })
 }
 
 const createId = (prefix: string) =>
@@ -197,8 +243,15 @@ export function createCarpoolRide(
     input.price < 1
   )
     throw new Error("필수 입력 항목을 확인해 주세요.")
+  const syncExtracted = getExtractedWaypointsSync(
+    input.start,
+    input.destination,
+    input.waypointsList ?? input.waypoints,
+  )
   const ride: DemoCarpoolRide = {
     ...input,
+    waypoints: syncExtracted.formatted || DIRECT_ROUTE_LABEL,
+    waypointsList: syncExtracted.waypointsList,
     id: createId("carpool"),
     driverId: input.driverId || "user-driver",
     driverName: input.driverName || "운전자",
@@ -209,17 +262,36 @@ export function createCarpoolRide(
     createdAt: new Date().toISOString(),
   }
   save({ ...snapshot, rides: [ride, ...snapshot.rides] })
-  // Supabase DB 비동기 연동
-  if (isSupabaseConfigured()) {
-    supabaseCreateRide(ride, input.driverId).then((inserted) => {
-      if (inserted?.id) {
-        const updatedRides = snapshot.rides.map((r) =>
-          r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
-        )
-        save({ ...snapshot, rides: updatedRides })
+  // 백엔드 지도 라우팅 기반 경유지 비동기 정밀 갱신 및 DB 저장
+  void fetchRouteWaypointsFromMapBackend({
+    start: ride.start,
+    destination: ride.destination,
+    fallbackWaypoints: input.waypoints,
+  })
+    .then((mapResult) => {
+      const updatedRide: DemoCarpoolRide = {
+        ...ride,
+        waypoints: mapResult.formatted || ride.waypoints || DIRECT_ROUTE_LABEL,
+        waypointsList: mapResult.waypointsList,
       }
-    }).catch(console.warn)
-  }
+      save({
+        ...snapshot,
+        rides: snapshot.rides.map((r) => (r.id === ride.id ? updatedRide : r)),
+      })
+      if (isSupabaseConfigured()) {
+        supabaseCreateRide(updatedRide, input.driverId)
+          .then((inserted) => {
+            if (inserted?.id) {
+              const updatedRides = snapshot.rides.map((r) =>
+                r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
+              )
+              save({ ...snapshot, rides: updatedRides })
+            }
+          })
+          .catch(console.warn)
+      }
+    })
+    .catch(console.warn)
   return ride
 }
 
@@ -389,6 +461,39 @@ export function settleCarpoolRide(rideId: string) {
       settlementStatus: "정산 완료",
     }).catch(console.warn)
   }
+}
+
+export function updateCarpoolRidesTimeAndDate(params: {
+  time?: string
+  date?: string
+}) {
+  const nextTime = params.time?.trim()
+  const nextDate = params.date?.trim()
+  if (!nextTime && !nextDate) return
+  if (snapshot.rides.length === 0) return
+
+  const updatedRides = snapshot.rides.map((ride) => {
+    const updatedDate = nextDate || ride.date
+    const updatedTime = nextTime || ride.time
+    const duration =
+      Number.isSafeInteger(ride.estimatedDuration) && ride.estimatedDuration > 0
+        ? ride.estimatedDuration
+        : DEFAULT_ESTIMATED_DURATION
+    const recalculatedEta =
+      calculateEstimatedArrival(updatedDate, updatedTime, duration) ||
+      ride.estimatedArrival
+    return {
+      ...ride,
+      date: updatedDate,
+      time: updatedTime,
+      estimatedArrival: recalculatedEta,
+    }
+  })
+
+  save({
+    ...snapshot,
+    rides: updatedRides,
+  })
 }
 
 export function addCarpoolReview(

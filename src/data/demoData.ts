@@ -85,9 +85,9 @@ export const demoProfileBadges: ProfileBadge[] = [
   {
     id: "driver-license",
     role: "driver",
-    label: "면허 인증 완료",
+    label: "면허증 인증",
     condition: "운전면허증 및 차량 정보 확인",
-    icon: "check",
+    icon: "shield",
     tone: "green",
   },
   {
