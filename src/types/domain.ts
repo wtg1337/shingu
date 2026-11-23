@@ -6,6 +6,7 @@ export type RouteData = {
   start: string
   destination: string
   waypoint: string
+  waypointsList?: string[]
   pickup: string
   weekdays: string[]
   departureTime: string
@@ -17,9 +18,15 @@ export type RouteData = {
 export type AccountData = {
   name: string
   id: string
+  loginId?: string
+  password?: string
   email: string
   phone: string
   gender: string
+  isDriverVerified?: boolean
+  licenseFileName?: string
+  vehicleName?: string
+  vehicleCapacity?: number
 }
 
 export type Ride = {
