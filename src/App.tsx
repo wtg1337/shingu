@@ -11216,6 +11216,43 @@ function SheetView({
 }
 
 
+function MobileStatusBar({ light = false }: { light?: boolean }) {
+  const [clock, setClock] = useState(() => {
+    const now = new Date()
+    return `${String(now.getHours()).padStart(2, "0")}:${String(
+      now.getMinutes(),
+    ).padStart(2, "0")}`
+  })
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = new Date()
+      setClock(
+        `${String(now.getHours()).padStart(2, "0")}:${String(
+          now.getMinutes(),
+        ).padStart(2, "0")}`,
+      )
+    }, 15000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  return (
+    <div
+      className={`device-status-bar ${light ? "device-status-bar--light" : ""}`}
+      aria-hidden="true"
+    >
+      <span className="device-status-time">{clock}</span>
+      <span className="device-dynamic-island" />
+      <span className="device-status-icons">
+        <span className="device-signal">5G</span>
+        <span className="device-battery">
+          <i />
+        </span>
+      </span>
+    </div>
+  )
+}
+
 export default function App() {
   const tripFlow = useSyncExternalStore(
     subscribeTripFlow,
@@ -11752,6 +11789,7 @@ export default function App() {
   if (splash)
     return (
       <main className="splash">
+        <MobileStatusBar light />
         <div className="splash-brand-card">
           <Brand transparent />
         </div>
@@ -11764,6 +11802,7 @@ export default function App() {
   if (!loggedIn)
     return (
       <div className="app-shell auth-shell">
+        <MobileStatusBar />
         <Auth
           view={auth}
           setView={setAuth}
@@ -11861,6 +11900,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <MobileStatusBar />
       {tab !== "chat" && (
         <Header
           role={role}
