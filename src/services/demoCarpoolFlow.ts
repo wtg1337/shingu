@@ -22,6 +22,8 @@ import {
   getOrCreateCarpoolChatRoom,
   sendRealtimeChatMessage,
 } from "./realtimeChatService"
+import { refundDemoPoints } from "./demoPoints"
+import { showAppToast } from "./dialogService"
 import { supabase, isSupabaseConfigured } from "../lib/supabase"
 
 export type CarpoolRideStatus = "모집 중" | "정산 대기" | "완료"
@@ -330,6 +332,10 @@ export function applyToCarpool(
     status: "승인 대기",
   }
   save({ ...snapshot, applications: [application, ...snapshot.applications] })
+  showAppToast({
+    message: `${ride.start} → ${ride.destination} 카풀 탑승 신청이 접수되었습니다.`,
+    variant: "success",
+  })
   if (isSupabaseConfigured()) {
     supabaseCreateApplication(rideId, currentRiderName, currentRiderId)
       .then((inserted) => {
@@ -350,6 +356,7 @@ export function applyToCarpool(
 export function decideCarpoolApplication(
   applicationId: string,
   decision: "approve" | "reject",
+  onNavigateChat?: (roomId: string) => void,
 ) {
   const application = snapshot.applications.find(
     (item) => item.id === applicationId,
@@ -389,6 +396,7 @@ export function decideCarpoolApplication(
         : snapshot.events,
   })
   if (decision === "approve") {
+    let createdRoomId = ""
     try {
       const chatRes = getOrCreateCarpoolChatRoom({
         currentUser: {
@@ -414,6 +422,7 @@ export function decideCarpoolApplication(
         },
       })
       if (chatRes.ok) {
+        createdRoomId = chatRes.room.id
         sendRealtimeChatMessage({
           roomId: chatRes.room.id,
           senderId: ride.driverId,
@@ -425,6 +434,22 @@ export function decideCarpoolApplication(
     } catch {
       // ignore chat auto-create warning
     }
+    showAppToast({
+      message: `${application.riderName}님의 탑승 신청을 수락했습니다. 매칭 채팅방이 열렸습니다!`,
+      variant: "success",
+      durationMs: 4500,
+      actionLabel:
+        createdRoomId && onNavigateChat ? "채팅방 바로가기" : undefined,
+      onAction:
+        createdRoomId && onNavigateChat
+          ? () => onNavigateChat(createdRoomId)
+          : undefined,
+    })
+  } else {
+    showAppToast({
+      message: `${application.riderName}님의 탑승 신청을 거절했습니다.`,
+      variant: "info",
+    })
   }
   if (isSupabaseConfigured()) {
     supabaseUpdateApplicationStatus(
@@ -446,6 +471,7 @@ export function cancelCarpoolApplication(applicationId: string) {
   const ride = snapshot.rides.find((item) => item.id === application.rideId)
   if (!ride || ride.status !== "모집 중")
     throw new Error("취소할 수 없는 카풀입니다.")
+  const wasApproved = application.status === "승인 완료"
   save({
     ...snapshot,
     applications: snapshot.applications.map((item) =>
@@ -457,11 +483,22 @@ export function cancelCarpoolApplication(applicationId: string) {
         type: "reservation-cancelled",
         applicationId,
         title: "카풀 예약이 취소되었습니다",
-        message: `${ride.date} ${ride.time} · ${ride.start} → ${ride.destination} 예약이 취소되었습니다.`,
+        message: wasApproved
+          ? `${ride.date} ${ride.time} · ${ride.start} → ${ride.destination} 예약이 취소되어 잔여 좌석 1석이 복구되고 ${ride.price.toLocaleString()} P가 환불되었습니다.`
+          : `${ride.date} ${ride.time} · ${ride.start} → ${ride.destination} 예약이 취소되었습니다.`,
         createdAt: new Date().toISOString(),
       },
       ...snapshot.events,
     ],
+  })
+  if (wasApproved && ride.price > 0) {
+    refundDemoPoints(ride.price)
+  }
+  showAppToast({
+    message: wasApproved
+      ? `예약 취소 완료 · 잔여 1석 복구 및 ${ride.price.toLocaleString()} P 자동 환불`
+      : "카풀 예약 신청이 취소되었습니다.",
+    variant: "info",
   })
   if (isSupabaseConfigured()) {
     supabaseUpdateApplicationStatus(applicationId, "취소 완료").catch(console.warn)

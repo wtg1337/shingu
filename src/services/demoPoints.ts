@@ -118,6 +118,24 @@ export function chargeDemoPoints(
   return charge
 }
 
+export function refundDemoPoints(amount: number): DemoPointCharge | null {
+  if (!Number.isSafeInteger(amount) || amount <= 0) return null
+  const balanceAfter = snapshot.balance + amount
+  const refundCharge: DemoPointCharge = {
+    id: `point-refund-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    amount,
+    paymentMethod: "카카오페이",
+    createdAt: new Date().toISOString(),
+    balanceAfter,
+    status: "데모 충전 완료",
+  }
+  publish({
+    balance: balanceAfter,
+    charges: [refundCharge, ...snapshot.charges],
+  })
+  return refundCharge
+}
+
 export async function syncPointWalletWithSupabase(userId?: string) {
   if (!isSupabaseConfigured()) return
   try {

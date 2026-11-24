@@ -171,7 +171,11 @@ import {
 } from "./services/realtimeChatService"
 import { supabase, isSupabaseConfigured } from "./lib/supabase"
 import GlobalDialog from "./components/GlobalDialog"
-import { showAppAlert, showAppConfirm } from "./services/dialogService"
+import {
+  showAppAlert,
+  showAppConfirm,
+  showAppToast,
+} from "./services/dialogService"
 import JsBarcode from "jsbarcode"
 import type {
   AccountData,
@@ -1788,7 +1792,7 @@ function Auth({
 
   const isValidSchoolEmail = (value: string) => {
     const trimmed = (value || "").trim().toLowerCase()
-    return /^[^\s@]+@[^\s@]+\.(ac\.kr|edu)$/i.test(trimmed)
+    return /^[^\s@]+@(g\.)?shingu\.ac\.kr$/i.test(trimmed)
   }
 
   const performBiometricAutoLogin = () => {
@@ -1844,7 +1848,7 @@ function Auth({
     }
     if (!isValidSchoolEmail(targetEmail)) {
       setEmailError(
-        "학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.",
+        "신구대학교 이메일(@g.shingu.ac.kr 또는 @shingu.ac.kr) 형식만 가입할 수 있습니다.",
       )
       setEmailNotice("")
       return
@@ -2103,10 +2107,13 @@ function Auth({
     }
     if (!isValidSchoolEmail(signupEmail)) {
       setStep(1)
-      setEmailError("학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.")
+      setEmailError(
+        "신구대학교 이메일(@g.shingu.ac.kr 또는 @shingu.ac.kr) 형식만 가입할 수 있습니다.",
+      )
       await showAppAlert({
         title: "학교 이메일 확인",
-        message: "학교 이메일 도메인 형식(예: student@shingu.ac.kr)으로 입력해 주세요.",
+        message:
+          "신구대학교 이메일(@g.shingu.ac.kr 또는 @shingu.ac.kr) 형식만 가입할 수 있습니다.",
       })
       return
     }
@@ -2303,6 +2310,10 @@ function Auth({
         }
       }
       // 별도의 이메일 인증 대기 화면 없이 자동 로그인되어 홈 화면으로 바로 진입
+      showAppToast({
+        message: "회원가입이 완료되어 자동으로 로그인되었습니다!",
+        variant: "success",
+      })
       onLogin(role, profilePayload, true)
     } catch (err) {
       await showAppAlert({
@@ -2431,12 +2442,12 @@ function Auth({
       }
       if (!isValidSchoolEmail(signupEmail)) {
         setEmailError(
-          "학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.",
+          "신구대학교 이메일(@g.shingu.ac.kr 또는 @shingu.ac.kr) 형식만 가입할 수 있습니다.",
         )
         await showAppAlert({
           title: "이메일 형식 확인",
           message:
-            "학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.",
+            "신구대학교 이메일(@g.shingu.ac.kr 또는 @shingu.ac.kr) 형식만 가입할 수 있습니다.",
         })
         return
       }
@@ -2962,8 +2973,13 @@ function Auth({
                 <span className={signupTermsAgreed ? "checked" : ""}>
                   {signupTermsAgreed && <Check />}
                 </span>{" "}
-                필수 약관 및 개인정보 처리방침에 동의합니다.
+                서비스 이용약관 및 개인정보 처리방침 동의 (필수)
               </label>
+              {!signupTermsAgreed && (
+                <span className="field-error">
+                  서비스 이용약관 및 개인정보 처리방침에 동의해 주세요.
+                </span>
+              )}
             </div>
           </section>
         )}
@@ -4236,7 +4252,11 @@ function DriverHome({
               </Button>
               <Button
                 onClick={() => {
-                  decideCarpoolApplication(decisionApplicationId, "approve")
+                  decideCarpoolApplication(
+                    decisionApplicationId,
+                    "approve",
+                    (roomId) => onOpenChat(roomId),
+                  )
                   setDecisionApplicationId(null)
                 }}
               >
@@ -4345,7 +4365,11 @@ function DriverHome({
                     거절
                   </Button>
                   <Button
-                    onClick={() => decideCarpoolApplication(app.id, "approve")}
+                    onClick={() =>
+                      decideCarpoolApplication(app.id, "approve", (roomId) =>
+                        onOpenChat(roomId),
+                      )
+                    }
                   >
                     승인
                   </Button>
@@ -6859,6 +6883,22 @@ function SheetView({
       open("safety")
       return
     }
+    if (type === "account-edit") {
+      open("account")
+      return
+    }
+    if (type === "mileage-history") {
+      open("mileage")
+      return
+    }
+    if (type === "application-detail") {
+      open("applications")
+      return
+    }
+    if (type === "driver-register" || type === "rider-register") {
+      open("roles")
+      return
+    }
     requestClose()
   }
   const addEvidenceImages = async (files: FileList | null) => {
@@ -7406,6 +7446,13 @@ function SheetView({
               </div>
             ) : (
               <p className="waypoints">{DIRECT_ROUTE_LABEL}</p>
+            )}
+            {pointWallet.balance < detailRide.price && (
+              <p className="field-error" style={{ marginBottom: "8px" }}>
+                보유 포인트({pointWallet.balance.toLocaleString()} P)가 카풀 요금(
+                {detailRide.price.toLocaleString()} P)보다 부족합니다. 정산 전까지
+                포인트를 충전해 주세요.
+              </p>
             )}
             <div className="ride-detail-cta-group">
               <Button
@@ -8697,6 +8744,25 @@ function SheetView({
                                 decideCarpoolApplication(
                                   application.id,
                                   "approve",
+                                  () =>
+                                    onStartCarpoolChat(
+                                      {
+                                        id:
+                                          application.riderId ||
+                                          `account-${application.riderName}`,
+                                        name: application.riderName,
+                                        role: "rider",
+                                      },
+                                      {
+                                        id: ride.id,
+                                        start: ride.start,
+                                        destination: ride.destination,
+                                        date: ride.date,
+                                        time: ride.time,
+                                        waypoints:
+                                          ride.waypoints || DIRECT_ROUTE_LABEL,
+                                      },
+                                    ),
                                 )
                               }
                             >
@@ -8704,26 +8770,28 @@ function SheetView({
                             </Button>
                           </div>
                         )}
-                      {role === "rider" &&
-                        (application.status === "승인 대기" ||
-                          application.status === "승인 완료") && (
-                          <Button
-                            variant="ghost"
-                            onClick={async () => {
-                              const ok = await showAppConfirm({
-                                title: "예약 취소 확인",
-                                message: "카풀 예약을 취소할까요?",
-                                confirmText: "예약 취소",
-                                cancelText: "돌아가기",
-                                variant: "danger",
-                              })
-                              if (!ok) return
-                              cancelCarpoolApplication(application.id)
-                            }}
-                          >
-                            예약 취소
-                          </Button>
-                        )}
+                      {(application.status === "승인 대기" ||
+                        application.status === "승인 완료") && (
+                        <Button
+                          variant="ghost"
+                          onClick={async () => {
+                            const ok = await showAppConfirm({
+                              title: "예약 취소 및 환불 확인",
+                              message:
+                                application.status === "승인 완료"
+                                  ? "카풀 예약을 취소할까요? 취소 시 차감된 포인트가 자동 환불되며 카풀 잔여 좌석(1석)이 즉시 복구됩니다."
+                                  : "카풀 예약 신청을 취소할까요?",
+                              confirmText: "예약 취소",
+                              cancelText: "돌아가기",
+                              variant: "danger",
+                            })
+                            if (!ok) return
+                            cancelCarpoolApplication(application.id)
+                          }}
+                        >
+                          예약 취소 (좌석 복구·환불)
+                        </Button>
+                      )}
                       {role === "rider" &&
                         ride.status === "완료" &&
                         !carpoolFlow.reviews.some(

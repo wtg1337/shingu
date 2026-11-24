@@ -800,24 +800,37 @@ export async function supabaseUpdateApplicationStatus(
 ) {
   if (!isSupabaseConfigured() || !isValidUuid(applicationId)) return false
   try {
+    const { data: existingReq } = await supabase
+      .from("carpool_requests")
+      .select("id, carpool_id, passenger_id, status")
+      .eq("id", applicationId)
+      .maybeSingle()
+
     const dbStatus = toDbRequestStatus(status)
     const { data: updatedReq, error } = await supabase
       .from("carpool_requests")
       .update({ status: dbStatus })
       .eq("id", applicationId)
-      .select("carpool_id")
+      .select("carpool_id, passenger_id")
       .maybeSingle()
     if (error) throw error
 
-    // 승인 완료 시 carpools.available_seats 차감 및 기본 공지 메시지 생성
-    if (dbStatus === "accepted" && updatedReq?.carpool_id) {
+    const targetCarpoolId = updatedReq?.carpool_id || existingReq?.carpool_id
+    const targetPassengerId =
+      updatedReq?.passenger_id || existingReq?.passenger_id
+
+    // 1) 승인 완료 시 carpools.available_seats 1석 차감 및 기본 공지 메시지 생성
+    if (dbStatus === "accepted" && targetCarpoolId) {
       const { data: carpoolData } = await supabase
         .from("carpools")
         .select("id, driver_id, origin, destination, available_seats")
-        .eq("id", updatedReq.carpool_id)
+        .eq("id", targetCarpoolId)
         .maybeSingle()
       if (carpoolData) {
-        const nextSeats = Math.max(0, (Number(carpoolData.available_seats) || 1) - 1)
+        const nextSeats = Math.max(
+          0,
+          (Number(carpoolData.available_seats) || 1) - 1,
+        )
         await supabase
           .from("carpools")
           .update({ available_seats: nextSeats })
@@ -833,6 +846,55 @@ export async function supabaseUpdateApplicationStatus(
         }
       }
     }
+
+    // 2) 취소 완료 시 잔여 좌석(available_seats) 1석 복구 및 포인트 자동 환불 기록
+    if (status === "취소 완료" && targetCarpoolId) {
+      const { data: carpoolData } = await supabase
+        .from("carpools")
+        .select("id, driver_id, origin, destination, available_seats, fee")
+        .eq("id", targetCarpoolId)
+        .maybeSingle()
+      if (carpoolData) {
+        const wasAccepted = existingReq?.status === "accepted"
+        if (wasAccepted) {
+          const restoredSeats = (Number(carpoolData.available_seats) || 0) + 1
+          await supabase
+            .from("carpools")
+            .update({ available_seats: restoredSeats })
+            .eq("id", carpoolData.id)
+        }
+
+        const feeAmount = Number(carpoolData.fee) || 0
+        if (wasAccepted && feeAmount > 0 && isValidUuid(targetPassengerId)) {
+          const { data: userRow } = await supabase
+            .from("users")
+            .select("points")
+            .eq("id", targetPassengerId)
+            .maybeSingle()
+          const nextPoints = (Number(userRow?.points) || 0) + feeAmount
+          await supabase
+            .from("users")
+            .update({ points: nextPoints })
+            .eq("id", targetPassengerId)
+          await supabase.from("point_transactions").insert({
+            user_id: targetPassengerId,
+            carpool_id: carpoolData.id,
+            type: "charge",
+            amount: feeAmount,
+          })
+        }
+
+        if (isValidUuid(carpoolData.driver_id)) {
+          await supabase.from("messages").insert({
+            carpool_id: carpoolData.id,
+            sender_id: carpoolData.driver_id,
+            message_type: "notice",
+            content: `[예약 취소] ${carpoolData.origin} → ${carpoolData.destination} 예약이 취소되어 잔여 좌석이 복구되었습니다.`,
+          })
+        }
+      }
+    }
+
     return true
   } catch (err) {
     console.warn("supabaseUpdateApplicationStatus failed:", err)
