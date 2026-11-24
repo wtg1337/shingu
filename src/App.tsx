@@ -89,6 +89,7 @@ import {
   getDemoPointWallet,
   resetDemoPoints,
   subscribeDemoPointWallet,
+  syncPointWalletWithSupabase,
   type DemoPaymentMethod,
   type DemoPointCharge,
   type DemoPointWallet,
@@ -105,6 +106,7 @@ import {
   resetCarpoolFlow,
   settleCarpoolRide,
   subscribeCarpoolFlow,
+  syncCarpoolWithSupabase,
   updateCarpoolRidesTimeAndDate,
   type DemoCarpoolRide,
   type DemoCarpoolApplication,
@@ -139,6 +141,7 @@ import {
   supabaseResetPassword,
   supabaseGetCurrentUser,
   supabaseGetProfile,
+  supabaseGetRoute,
   supabaseSaveRoute,
   supabaseUpdateProfile,
   subscribeUserProfileRealtime,
@@ -1682,6 +1685,7 @@ function Auth({
   const [signupGender, setSignupGender] = useState("")
   const [signupTermsAgreed, setSignupTermsAgreed] = useState(true)
   const [driverLicenseSelected, setDriverLicenseSelected] = useState(false)
+  const [driverLicenseFile, setDriverLicenseFile] = useState<File | null>(null)
   const [driverLicenseFileName, setDriverLicenseFileName] = useState("")
   const [driverLicenseFileSize, setDriverLicenseFileSize] = useState("")
   const [driverLicensePreview, setDriverLicensePreview] = useState<string | null>(null)
@@ -1920,6 +1924,7 @@ function Auth({
   const handleDriverLicenseUpload = (files: FileList | null) => {
     if (!files || files.length === 0) {
       setDriverLicenseSelected(false)
+      setDriverLicenseFile(null)
       setDriverLicenseFileName("")
       setDriverLicenseFileSize("")
       setDriverLicensePreview(null)
@@ -1933,10 +1938,12 @@ function Auth({
     if (!isImage && !isPdf) {
       setDriverLicenseError("운전면허증은 이미지(JPG, PNG 등) 또는 PDF 파일만 업로드할 수 있습니다.")
       setDriverLicenseSelected(false)
+      setDriverLicenseFile(null)
       return
     }
     setDriverLicenseError("")
     setDriverLicenseSelected(true)
+    setDriverLicenseFile(file)
     setDriverLicenseFileName(file.name)
     const sizeKb = Math.max(1, Math.round(file.size / 1024))
     setDriverLicenseFileSize(
@@ -1982,25 +1989,46 @@ function Auth({
           const result = await supabaseSignIn(email, loginPassword)
           const user = result?.user
           const meta = user?.user_metadata
+          const dbProfile = user?.id ? await supabaseGetProfile(user.id) : null
           const resolvedRole: Role =
-            meta?.role === "driver" || meta?.role === "rider"
+            dbProfile?.role ||
+            (meta?.role === "driver" || meta?.role === "rider"
               ? meta.role
-              : matchedLocal?.role || targetRole
+              : matchedLocal?.role || targetRole)
           const loggedInProfile: AccountData = {
-            name: meta?.name || matchedLocal?.name || email.split("@")[0] || "사용자",
+            name:
+              dbProfile?.name ||
+              meta?.name ||
+              matchedLocal?.name ||
+              email.split("@")[0] ||
+              "사용자",
             email: user?.email || email,
-            id: trimmedLoginId,
-            loginId: trimmedLoginId,
+            id: user?.id || trimmedLoginId,
+            loginId: dbProfile?.loginId || trimmedLoginId,
             password: loginPassword,
-            phone: meta?.phone || matchedLocal?.phone || "",
-            gender: meta?.gender || matchedLocal?.gender || "선택 안 함",
+            phone: dbProfile?.phone || meta?.phone || matchedLocal?.phone || "",
+            gender:
+              dbProfile?.gender ||
+              meta?.gender ||
+              matchedLocal?.gender ||
+              "선택 안 함",
             isDriverVerified:
-              Boolean(meta?.isDriverVerified) || Boolean(matchedLocal?.isDriverVerified),
-            licenseFileName: meta?.licenseFileName || matchedLocal?.licenseFileName,
-            vehicleName: meta?.vehicleName || matchedLocal?.vehicleName,
-            vehicleCapacity: meta?.vehicleCapacity
-              ? Number(meta.vehicleCapacity)
-              : matchedLocal?.vehicleCapacity,
+              Boolean(dbProfile?.isDriverVerified) ||
+              Boolean(meta?.isDriverVerified) ||
+              Boolean(matchedLocal?.isDriverVerified),
+            licenseFileName:
+              dbProfile?.licenseFileName ||
+              meta?.licenseFileName ||
+              matchedLocal?.licenseFileName,
+            vehicleName:
+              dbProfile?.vehicleName ||
+              meta?.vehicleName ||
+              matchedLocal?.vehicleName,
+            vehicleCapacity:
+              dbProfile?.vehicleCapacity ||
+              (meta?.vehicleCapacity
+                ? Number(meta.vehicleCapacity)
+                : matchedLocal?.vehicleCapacity),
           }
           upsertRegisteredMember({
             ...loggedInProfile,
@@ -2073,12 +2101,12 @@ function Auth({
       })
       return
     }
-    if (!verified) {
+    if (!isValidSchoolEmail(signupEmail)) {
       setStep(1)
-      setEmailError("학교 이메일 인증을 먼저 완료해 주세요.")
+      setEmailError("학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.")
       await showAppAlert({
-        title: "이메일 인증 필요",
-        message: "학교 이메일 인증을 먼저 완료해 주세요.",
+        title: "학교 이메일 확인",
+        message: "학교 이메일 도메인 형식(예: student@shingu.ac.kr)으로 입력해 주세요.",
       })
       return
     }
@@ -2257,13 +2285,15 @@ function Auth({
         try {
           const signUpRes = await supabaseSignUp(email, signupPassword, {
             name: signupName.trim(),
+            studentId: cleanSignupId,
             phone: normalizedPhone,
             gender: signupGender.trim(),
             role,
             isDriverVerified,
+            licenseFile: driverLicenseFile,
             licenseFileName: driverLicenseFileName,
             vehicleName: vehicleName.trim(),
-            vehicleCapacity: Number(vehicleCapacity) || 5,
+            vehicleCapacity: Number(vehicleCapacity) || 4,
           })
           if (signUpRes?.user?.id) {
             profilePayload.id = signUpRes.user.id
@@ -2272,11 +2302,7 @@ function Auth({
           console.warn("Supabase 회원가입 폴백 처리:", supabaseErr)
         }
       }
-      await showAppAlert({
-        title: "회원가입 완료",
-        message: "회원가입이 완료되었습니다!",
-        variant: "success",
-      })
+      // 별도의 이메일 인증 대기 화면 없이 자동 로그인되어 홈 화면으로 바로 진입
       onLogin(role, profilePayload, true)
     } catch (err) {
       await showAppAlert({
@@ -2403,14 +2429,19 @@ function Auth({
         })
         return
       }
-      if (!verified) {
-        setEmailError("학교 이메일 인증을 완료해야 다음 단계로 이동할 수 있습니다.")
+      if (!isValidSchoolEmail(signupEmail)) {
+        setEmailError(
+          "학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.",
+        )
         await showAppAlert({
-          title: "이메일 인증 필요",
-          message: "학교 이메일 인증을 완료해야 다음 단계로 이동할 수 있습니다.",
+          title: "이메일 형식 확인",
+          message:
+            "학교 이메일 도메인 형식(예: student@shingu.ac.kr 등 .ac.kr)으로 입력해 주세요.",
         })
         return
       }
+      setVerified(true)
+      setEmailError("")
       setStep(2)
       return
     }
@@ -11270,6 +11301,25 @@ export default function App() {
         setRole(resolvedProfile.role)
         writeDemoValue("demo-role", resolvedProfile.role)
       }
+
+      // schedules, carpools, carpool_requests, point_transactions 동기화
+      void syncCarpoolWithSupabase()
+      void syncPointWalletWithSupabase(uid)
+      void Promise.all([
+        supabaseGetRoute(uid, "rider"),
+        supabaseGetRoute(uid, "driver"),
+      ]).then(([riderRoute, driverRoute]) => {
+        if (riderRoute || driverRoute) {
+          setRoutesByRole((prev) => {
+            const nextRoutes: Record<Role, RouteData> = {
+              rider: riderRoute || prev.rider,
+              driver: driverRoute || prev.driver,
+            }
+            writeDemoData("routes", nextRoutes)
+            return nextRoutes
+          })
+        }
+      })
 
       if (unsubscribeRealtime) unsubscribeRealtime()
       unsubscribeRealtime = subscribeUserProfileRealtime(

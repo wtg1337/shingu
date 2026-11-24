@@ -14,8 +14,14 @@ import {
   supabaseGetApplications,
   supabaseCreateApplication,
   supabaseUpdateApplicationStatus,
+  supabaseGetReviews,
   supabaseSubmitReview,
+  supabaseRecordCarpoolSettlement,
 } from "./supabaseService"
+import {
+  getOrCreateCarpoolChatRoom,
+  sendRealtimeChatMessage,
+} from "./realtimeChatService"
 import { supabase, isSupabaseConfigured } from "../lib/supabase"
 
 export type CarpoolRideStatus = "모집 중" | "정산 대기" | "완료"
@@ -325,7 +331,18 @@ export function applyToCarpool(
   }
   save({ ...snapshot, applications: [application, ...snapshot.applications] })
   if (isSupabaseConfigured()) {
-    supabaseCreateApplication(rideId, currentRiderName, currentRiderId).catch(console.warn)
+    supabaseCreateApplication(rideId, currentRiderName, currentRiderId)
+      .then((inserted) => {
+        if (inserted?.id) {
+          save({
+            ...snapshot,
+            applications: snapshot.applications.map((a) =>
+              a.id === application.id ? { ...a, id: String(inserted.id) } : a,
+            ),
+          })
+        }
+      })
+      .catch(console.warn)
   }
   return application
 }
@@ -371,6 +388,44 @@ export function decideCarpoolApplication(
           ]
         : snapshot.events,
   })
+  if (decision === "approve") {
+    try {
+      const chatRes = getOrCreateCarpoolChatRoom({
+        currentUser: {
+          id: ride.driverId,
+          loginId: ride.driverId,
+          name: ride.driverName || "운전자",
+          role: "driver",
+          carInfo: ride.vehicle,
+          isDriverVerified: true,
+        },
+        targetUser: {
+          id: application.riderId,
+          name: application.riderName || "탑승자",
+          role: "rider",
+        },
+        ride: {
+          id: ride.id,
+          start: ride.start,
+          destination: ride.destination,
+          date: ride.date,
+          time: ride.time,
+          waypoints: ride.waypoints,
+        },
+      })
+      if (chatRes.ok) {
+        sendRealtimeChatMessage({
+          roomId: chatRes.room.id,
+          senderId: ride.driverId,
+          senderName: ride.driverName || "운전자",
+          text: `[매칭 완료] ${application.riderName}님의 카풀 탑승 신청이 수락되었습니다.`,
+          messageType: "notice",
+        })
+      }
+    } catch {
+      // ignore chat auto-create warning
+    }
+  }
   if (isSupabaseConfigured()) {
     supabaseUpdateApplicationStatus(
       applicationId,
@@ -459,6 +514,11 @@ export function settleCarpoolRide(rideId: string) {
     supabaseUpdateRideStatus(rideId, "완료", {
       settledAt,
       settlementStatus: "정산 완료",
+    }).catch(console.warn)
+    supabaseRecordCarpoolSettlement({
+      driverId: ride.driverId,
+      carpoolId: ride.id,
+      amount: ride.price,
     }).catch(console.warn)
   }
 }
@@ -560,12 +620,17 @@ export function getRemainingSeats(state: DemoCarpoolState, rideId: string) {
 export async function syncCarpoolWithSupabase() {
   if (!isSupabaseConfigured() || typeof window === "undefined") return
   try {
-    const [remoteRides, remoteApps] = await Promise.all([
+    const [remoteRides, remoteApps, remoteReviews] = await Promise.all([
       supabaseGetRides(),
       supabaseGetApplications(),
+      supabaseGetReviews(),
     ])
 
-    if (remoteRides.length > 0 || remoteApps.length > 0) {
+    if (
+      remoteRides.length > 0 ||
+      remoteApps.length > 0 ||
+      remoteReviews.length > 0
+    ) {
       const rideMap = new Map<string, DemoCarpoolRide>()
       snapshot.rides.forEach((r) => rideMap.set(r.id, r))
       remoteRides.forEach((r) => rideMap.set(r.id, r))
@@ -574,10 +639,15 @@ export async function syncCarpoolWithSupabase() {
       snapshot.applications.forEach((a) => appMap.set(a.id, a))
       remoteApps.forEach((a) => appMap.set(a.id, a))
 
+      const revMap = new Map<string, DemoCarpoolReview>()
+      snapshot.reviews.forEach((rev) => revMap.set(rev.id, rev))
+      remoteReviews.forEach((rev) => revMap.set(rev.id, rev))
+
       save({
         ...snapshot,
         rides: Array.from(rideMap.values()),
         applications: Array.from(appMap.values()),
+        reviews: Array.from(revMap.values()),
       })
     }
   } catch (err) {
@@ -596,18 +666,23 @@ if (typeof window !== "undefined") {
     // 초기 로드 시 Supabase 데이터 동기화
     syncCarpoolWithSupabase()
 
-    // 실시간 변경 구독
+    // 실시간 변경 구독 (carpools, carpool_requests, reviews)
     try {
       supabase
         .channel("carpool-realtime-changes")
         .on(
           "postgres_changes",
-          { event: "*", schema: "public", table: "rides" },
+          { event: "*", schema: "public", table: "carpools" },
           () => syncCarpoolWithSupabase(),
         )
         .on(
           "postgres_changes",
-          { event: "*", schema: "public", table: "carpool_applications" },
+          { event: "*", schema: "public", table: "carpool_requests" },
+          () => syncCarpoolWithSupabase(),
+        )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "reviews" },
           () => syncCarpoolWithSupabase(),
         )
         .subscribe()

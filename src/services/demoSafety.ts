@@ -6,6 +6,8 @@ import {
   writeDemoData,
 } from "./demoStore"
 import {
+  supabaseGetBlockedUsers,
+  supabaseGetSafetyReports,
   supabaseSubmitSafetyReport,
   supabaseUnblockUser,
 } from "./supabaseService"
@@ -15,9 +17,18 @@ const REPORTS_KEY = "safety-reports"
 const BLOCKED_KEY = "blocked-users"
 
 export function getSafetyReports() {
-  return readDemoValue(REPORTS_KEY) === null
-    ? defaultSafetyReports
-    : readDemoList<SafetyReport>(REPORTS_KEY)
+  const local =
+    readDemoValue(REPORTS_KEY) === null
+      ? defaultSafetyReports
+      : readDemoList<SafetyReport>(REPORTS_KEY)
+  if (isSupabaseConfigured()) {
+    void supabaseGetSafetyReports().then((remote) => {
+      if (remote.length > 0) {
+        writeDemoData(REPORTS_KEY, remote)
+      }
+    })
+  }
+  return local
 }
 
 export function submitSafetyReport(report: SafetyReport) {
@@ -30,9 +41,18 @@ export function submitSafetyReport(report: SafetyReport) {
 }
 
 export function getBlockedUsers() {
-  return readDemoValue(BLOCKED_KEY) === null
-    ? defaultBlockedUsers
-    : readDemoList<BlockedUser>(BLOCKED_KEY)
+  const local =
+    readDemoValue(BLOCKED_KEY) === null
+      ? defaultBlockedUsers
+      : readDemoList<BlockedUser>(BLOCKED_KEY)
+  if (isSupabaseConfigured()) {
+    void supabaseGetBlockedUsers().then((remote) => {
+      if (remote.length > 0) {
+        writeDemoData(BLOCKED_KEY, remote)
+      }
+    })
+  }
+  return local
 }
 
 export function unblockDemoUser(userId: string) {

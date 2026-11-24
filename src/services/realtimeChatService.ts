@@ -1,6 +1,11 @@
 import { supabase, isSupabaseConfigured } from "../lib/supabase"
 import type { Role } from "../types/domain"
 import { DIRECT_ROUTE_LABEL } from "./routeWaypointService"
+import {
+  supabaseGetMessages,
+  supabaseSendMessage,
+  type DbMessageRow,
+} from "./supabaseService"
 
 export type ChatParticipantProfile = {
   id: string
@@ -17,6 +22,7 @@ export type RealtimeChatMessage = {
   senderId: string
   senderName: string
   text: string
+  messageType?: "text" | "notice" | "settlement"
   createdAt: string
 }
 
@@ -134,6 +140,8 @@ function initRealtimeTransport() {
   if (!supabaseRealtimeInitialized && isSupabaseConfigured()) {
     supabaseRealtimeInitialized = true
     try {
+      void syncMessagesFromSupabase()
+
       const channel = supabase.channel("shingu-live-chat")
       channel
         .on("broadcast", { event: "chat_message" }, (payload) => {
@@ -151,10 +159,89 @@ function initRealtimeTransport() {
           if (!incomingRoom?.id) return
           mergeIncomingRoom(incomingRoom)
         })
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "messages" },
+          (payload) => {
+            const newRow = payload?.new as DbMessageRow | undefined
+            if (!newRow?.id || !newRow?.carpool_id) return
+            mergeDbMessageRow(newRow)
+          },
+        )
         .subscribe()
     } catch {
       // Supabase Realtime 연결 실패 시 로컬/BroadcastChannel 폴백 유지
     }
+  }
+}
+
+export async function syncMessagesFromSupabase() {
+  if (!isSupabaseConfigured()) return
+  try {
+    const dbMessages = await supabaseGetMessages()
+    for (const row of dbMessages) {
+      mergeDbMessageRow(row)
+    }
+  } catch {
+    // ignore sync error
+  }
+}
+
+function mergeDbMessageRow(row: DbMessageRow) {
+  const current = readChatState()
+  const matchingRooms = current.rooms.filter(
+    (r) => r.rideId === String(row.carpool_id) || r.id === String(row.carpool_id),
+  )
+  if (matchingRooms.length === 0) return
+
+  let changed = false
+  const nextMessagesByRoom = { ...current.messagesByRoom }
+  const nextRooms = current.rooms.map((room) => {
+    if (
+      room.rideId !== String(row.carpool_id) &&
+      room.id !== String(row.carpool_id)
+    ) {
+      return room
+    }
+    const existing = Array.isArray(nextMessagesByRoom[room.id])
+      ? nextMessagesByRoom[room.id]
+      : []
+    const alreadyExists = existing.some(
+      (m) =>
+        m.id === String(row.id) ||
+        (m.senderId === String(row.sender_id) && m.text === row.content),
+    )
+    if (alreadyExists) return room
+
+    changed = true
+    const senderProfile = room.participantProfiles?.[String(row.sender_id)]
+    const msg: RealtimeChatMessage = {
+      id: String(row.id),
+      roomId: room.id,
+      senderId: String(row.sender_id),
+      senderName: senderProfile?.name || "학우",
+      text: row.content || "",
+      messageType: row.message_type || "text",
+      createdAt: row.created_at || new Date().toISOString(),
+    }
+    nextMessagesByRoom[room.id] = [...existing, msg].sort((a, b) =>
+      a.createdAt.localeCompare(b.createdAt),
+    )
+    return {
+      ...room,
+      lastMessage: msg.text,
+      lastMessageAt: msg.createdAt,
+    }
+  })
+
+  if (changed) {
+    saveChatState(
+      {
+        rooms: nextRooms,
+        messagesByRoom: nextMessagesByRoom,
+      },
+      false,
+    )
   }
 }
 
@@ -490,6 +577,7 @@ export function sendRealtimeChatMessage(params: {
   senderId: string
   senderName?: string | null
   text: string
+  messageType?: "text" | "notice" | "settlement"
 }): RealtimeChatMessage | null {
   const cleanRoomId = (params.roomId || "").trim()
   const cleanSenderId = normalizeUserId(params.senderId)
@@ -507,6 +595,7 @@ export function sendRealtimeChatMessage(params: {
     senderId: cleanSenderId,
     senderName: normalizeDisplayName(params.senderName),
     text: cleanText,
+    messageType: params.messageType || "text",
     createdAt: nowIso,
   }
 
@@ -537,6 +626,12 @@ export function sendRealtimeChatMessage(params: {
   )
 
   if (isSupabaseConfigured()) {
+    void supabaseSendMessage({
+      carpoolId: targetRoom.rideId,
+      senderId: cleanSenderId,
+      content: cleanText,
+      messageType: params.messageType || "text",
+    })
     try {
       supabase
         .channel("shingu-live-chat")

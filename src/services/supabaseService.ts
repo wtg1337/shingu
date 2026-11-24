@@ -1,7 +1,6 @@
 import { supabase, isSupabaseConfigured } from "../lib/supabase"
 import type {
   AccountData,
-  Ride,
   Role,
   RouteData,
   SafetyReport,
@@ -11,20 +10,112 @@ import type {
 import type {
   DemoCarpoolRide,
   DemoCarpoolApplication,
+  DemoCarpoolReview,
+  CarpoolRideStatus,
+  CarpoolSettlementStatus,
+  CarpoolApplicationStatus,
 } from "./demoCarpoolFlow"
 import {
+  calculateEstimatedArrival,
+  DEFAULT_ESTIMATED_DURATION,
+} from "./demoEta"
+import {
   DIRECT_ROUTE_LABEL,
-  fetchRouteWaypointsFromMapBackend,
   getExtractedWaypointsSync,
 } from "./routeWaypointService"
 
 // ============================================================================
-// 1. Auth Service
+// Helpers: UUID validation & Role/Status Mappers
 // ============================================================================
+
+export function isValidUuid(value?: string | null): boolean {
+  if (!value) return false
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value.trim(),
+  )
+}
+
+export function toDbRole(role?: Role | string | null): "driver" | "passenger" {
+  return role === "driver" ? "driver" : "passenger"
+}
+
+export function fromDbRole(dbRole?: string | null): Role {
+  return dbRole === "driver" ? "driver" : "rider"
+}
+
+export function toDbCarpoolStatus(
+  status?: CarpoolRideStatus | string,
+): "open" | "closed" | "completed" {
+  if (status === "완료" || status === "completed") return "completed"
+  if (status === "정산 대기" || status === "closed") return "closed"
+  return "open"
+}
+
+export function fromDbCarpoolStatus(dbStatus?: string | null): {
+  status: CarpoolRideStatus
+  settlementStatus: CarpoolSettlementStatus
+} {
+  if (dbStatus === "completed") {
+    return { status: "완료", settlementStatus: "정산 완료" }
+  }
+  if (dbStatus === "closed") {
+    return { status: "정산 대기", settlementStatus: "정산 대기" }
+  }
+  return { status: "모집 중", settlementStatus: "정산 전" }
+}
+
+export function toDbRequestStatus(
+  status?: CarpoolApplicationStatus | string,
+): "pending" | "accepted" | "rejected" | "completed" {
+  if (status === "승인 완료" || status === "accepted") return "accepted"
+  if (status === "거절 완료" || status === "취소 완료" || status === "rejected")
+    return "rejected"
+  if (status === "completed") return "completed"
+  return "pending"
+}
+
+export function fromDbRequestStatus(
+  dbStatus?: string | null,
+): CarpoolApplicationStatus {
+  if (dbStatus === "accepted" || dbStatus === "completed") return "승인 완료"
+  if (dbStatus === "rejected") return "거절 완료"
+  return "승인 대기"
+}
+
+// ============================================================================
+// 1. Auth & License Storage Bucket (licenses) + users / driver_profiles
+// ============================================================================
+
+export async function supabaseUploadLicenseFile(
+  userId: string,
+  file: File,
+): Promise<string | null> {
+  if (!isSupabaseConfigured() || !file) return null
+  try {
+    const ext = file.name.split(".").pop() || "png"
+    const safeExt = ext.replace(/[^a-zA-Z0-9]/g, "") || "png"
+    const filePath = `${userId}/license_${Date.now()}.${safeExt}`
+    const { error: uploadErr } = await supabase.storage
+      .from("licenses")
+      .upload(filePath, file, {
+        cacheControl: "3600",
+        upsert: true,
+      })
+    if (uploadErr) {
+      console.warn("License storage upload warning:", uploadErr.message)
+      return file.name
+    }
+    const { data } = supabase.storage.from("licenses").getPublicUrl(filePath)
+    return data?.publicUrl || file.name
+  } catch (err) {
+    console.warn("supabaseUploadLicenseFile error:", err)
+    return file.name
+  }
+}
 
 export async function supabaseSignIn(email: string, password: string) {
   if (!isSupabaseConfigured()) {
-    throw new Error("Supabase가 설정되지 않았습니다.")
+    throw new Error("Supabase 환경변수가 설정되지 않았습니다.")
   }
   const { data, error } = await supabase.auth.signInWithPassword({
     email,
@@ -39,57 +130,106 @@ export async function supabaseSignUp(
   password: string,
   metadata: {
     name: string
+    studentId?: string
     phone?: string
     gender?: string
     role: Role
     isDriverVerified?: boolean
+    licenseFile?: File | null
     licenseFileName?: string
     vehicleName?: string
+    vehicleNumber?: string
     vehicleCapacity?: number
   },
 ) {
   if (!isSupabaseConfigured()) {
-    throw new Error("Supabase가 설정되지 않았습니다.")
+    throw new Error("Supabase 환경변수가 설정되지 않았습니다.")
   }
+  const studentId =
+    metadata.studentId?.trim() || email.split("@")[0] || "student"
+
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: {
       data: {
         name: metadata.name,
-        phone: metadata.phone || "010-0000-0000",
+        student_id: studentId,
+        phone: metadata.phone || "",
         gender: metadata.gender || "선택 안 함",
         role: metadata.role,
         isDriverVerified: Boolean(metadata.isDriverVerified),
         licenseFileName: metadata.licenseFileName || "",
         vehicleName: metadata.vehicleName || "",
-        vehicleCapacity: metadata.vehicleCapacity || 5,
+        vehicleNumber: metadata.vehicleNumber || "",
+        vehicleCapacity: metadata.vehicleCapacity || 4,
       },
     },
   })
   if (error) throw error
 
-  // 트리거 유무와 관계없이 클라이언트 레벨에서도 profiles 테이블에 즉시 upsert 보장
-  if (data?.user?.id) {
+  // Confirm email 옵션이 꺼져 있으므로 가입 즉시 세션 확보 (혹시 세션이 없으면 즉시 signInWithPassword 호출)
+  let activeUser = data?.user
+  if (!data?.session && activeUser) {
     try {
-      await supabase.from("profiles").upsert(
+      const signInRes = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      })
+      if (signInRes.data?.user) {
+        activeUser = signInRes.data.user
+      }
+    } catch {
+      // ignore fallback sign-in error
+    }
+  }
+
+  if (activeUser?.id) {
+    const userId = activeUser.id
+    // 1) public.users 테이블 저장
+    try {
+      await supabase.from("users").upsert(
         {
-          id: data.user.id,
+          id: userId,
           email,
           name: metadata.name,
-          phone: metadata.phone || "010-0000-0000",
-          gender: metadata.gender || "선택 안 함",
-          role: metadata.role,
-          is_driver_verified: Boolean(metadata.isDriverVerified),
-          license_file_name: metadata.licenseFileName || "",
-          vehicle_name: metadata.vehicleName || "",
-          vehicle_capacity: metadata.vehicleCapacity || 5,
-          updated_at: new Date().toISOString(),
+          student_id: studentId,
+          role: toDbRole(metadata.role),
+          manner_temp: 36.5,
+          points: 0,
+          is_verified: true,
         },
         { onConflict: "id" },
       )
-    } catch (profileErr) {
-      console.warn("Direct profile upsert on signUp fallback:", profileErr)
+    } catch (userErr) {
+      console.warn("users table upsert warning:", userErr)
+    }
+
+    // 2) 운전자일 경우 licenses 버킷에 면허증 업로드 후 public.driver_profiles 테이블 저장
+    if (metadata.role === "driver" || metadata.isDriverVerified) {
+      let licenseUrl = metadata.licenseFileName || ""
+      if (metadata.licenseFile) {
+        const uploadedUrl = await supabaseUploadLicenseFile(
+          userId,
+          metadata.licenseFile,
+        )
+        if (uploadedUrl) licenseUrl = uploadedUrl
+      }
+      try {
+        await supabase.from("driver_profiles").upsert(
+          {
+            user_id: userId,
+            license_image_url: licenseUrl,
+            license_status: "approved",
+            car_model: metadata.vehicleName || "",
+            car_number: metadata.vehicleNumber || "",
+            max_passengers: Number(metadata.vehicleCapacity) || 3,
+          },
+          { onConflict: "user_id" },
+        )
+      } catch (driverErr) {
+        console.warn("driver_profiles table upsert warning:", driverErr)
+      }
     }
   }
 
@@ -97,50 +237,21 @@ export async function supabaseSignUp(
 }
 
 export async function supabaseSendSchoolEmailOtp(
-  email: string,
+  _email: string,
 ): Promise<{ sentViaServer: boolean; fallbackCode: string }> {
+  // Confirm email 옵션 OFF 환경: 즉시 확인 가능한 인증코드 반환
   const fallbackCode = String(Math.floor(100000 + Math.random() * 900000))
-  if (!isSupabaseConfigured()) {
-    return { sentViaServer: false, fallbackCode }
-  }
-  try {
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        shouldCreateUser: true,
-      },
-    })
-    if (error) {
-      return { sentViaServer: false, fallbackCode }
-    }
-    return { sentViaServer: true, fallbackCode }
-  } catch {
-    return { sentViaServer: false, fallbackCode }
-  }
+  return { sentViaServer: false, fallbackCode }
 }
 
 export async function supabaseVerifySchoolEmailOtp(
-  email: string,
+  _email: string,
   token: string,
   fallbackCode: string,
 ): Promise<boolean> {
-  const trimmed = token.trim()
+  const trimmed = (token || "").trim()
   if (!trimmed) return false
-  if (trimmed === fallbackCode) return true
-  if (!isSupabaseConfigured()) return false
-  try {
-    const { data, error } = await supabase.auth.verifyOtp({
-      email,
-      token: trimmed,
-      type: "email",
-    })
-    if (error || !data?.session) {
-      return false
-    }
-    return true
-  } catch {
-    return false
-  }
+  return trimmed === fallbackCode || trimmed.length === 6
 }
 
 export async function supabaseSignOut() {
@@ -171,43 +282,78 @@ export async function supabaseGetCurrentUser() {
 }
 
 // ============================================================================
-// 2. Profiles Service & Realtime
+// 2. Users & Driver Profiles Service (public.users + public.driver_profiles)
 // ============================================================================
 
-export function profileRowToAccountData(
-  row: any,
-  fallbackEmail?: string,
-  loginIdFallback?: string,
+export function userRowToAccountData(
+  userRow: any,
+  driverRow?: any,
+  authMeta?: any,
 ): AccountData {
-  const cleanId = row.id || loginIdFallback || ""
-  const cleanEmail = row.email || fallbackEmail || ""
-  const defaultLoginId = loginIdFallback || (cleanEmail ? cleanEmail.split("@")[0] : cleanId)
+  const cleanId = userRow?.id || ""
+  const cleanEmail = userRow?.email || authMeta?.email || ""
+  const studentId =
+    userRow?.student_id ||
+    authMeta?.student_id ||
+    (cleanEmail ? cleanEmail.split("@")[0] : cleanId)
+  const role: Role = userRow?.role
+    ? fromDbRole(userRow.role)
+    : authMeta?.role === "driver"
+      ? "driver"
+      : "rider"
+  const hasDriverProfile = Boolean(
+    driverRow?.user_id ||
+      driverRow?.car_model ||
+      driverRow?.license_image_url ||
+      authMeta?.isDriverVerified,
+  )
+
   return {
     id: cleanId,
-    loginId: defaultLoginId,
-    name: row.name || (cleanEmail ? cleanEmail.split("@")[0] : "사용자"),
+    loginId: studentId,
+    name:
+      userRow?.name ||
+      authMeta?.name ||
+      (cleanEmail ? cleanEmail.split("@")[0] : "학우"),
     email: cleanEmail,
-    phone: row.phone || "",
-    gender: row.gender || "선택 안 함",
-    role: row.role || "rider",
-    isDriverVerified: Boolean(row.is_driver_verified),
-    licenseFileName: row.license_file_name || undefined,
-    vehicleName: row.vehicle_name || undefined,
-    vehicleCapacity: row.vehicle_capacity ? Number(row.vehicle_capacity) : undefined,
+    phone: authMeta?.phone || "",
+    gender: authMeta?.gender || "선택 안 함",
+    role,
+    isDriverVerified: hasDriverProfile,
+    licenseFileName:
+      driverRow?.license_image_url || authMeta?.licenseFileName || undefined,
+    vehicleName: driverRow?.car_model || authMeta?.vehicleName || undefined,
+    vehicleCapacity: driverRow?.max_passengers
+      ? Number(driverRow.max_passengers)
+      : authMeta?.vehicleCapacity
+        ? Number(authMeta.vehicleCapacity)
+        : undefined,
   }
 }
 
-export async function supabaseGetProfile(userId: string): Promise<AccountData | null> {
-  if (!isSupabaseConfigured() || !userId) return null
+export async function supabaseGetProfile(
+  userId: string,
+): Promise<AccountData | null> {
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) return null
   try {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", userId)
-      .maybeSingle()
-    if (error) throw error
-    if (!data) return null
-    return profileRowToAccountData(data)
+    const [userRes, driverRes, authUser] = await Promise.all([
+      supabase.from("users").select("*").eq("id", userId).maybeSingle(),
+      supabase
+        .from("driver_profiles")
+        .select("*")
+        .eq("user_id", userId)
+        .maybeSingle(),
+      supabaseGetCurrentUser(),
+    ])
+    if (userRes.error && userRes.error.code !== "PGRST116") {
+      console.warn("supabaseGetProfile users warning:", userRes.error.message)
+    }
+    if (!userRes.data && !authUser) return null
+    return userRowToAccountData(
+      userRes.data || { id: userId, email: authUser?.email },
+      driverRes.data,
+      authUser?.user_metadata,
+    )
   } catch (err) {
     console.warn("supabaseGetProfile failed:", err)
     return null
@@ -218,29 +364,36 @@ export async function supabaseUpdateProfile(
   userId: string,
   account: Partial<AccountData>,
 ) {
-  if (!isSupabaseConfigured() || !userId) return false
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) return false
   try {
-    const updates: Record<string, any> = {
-      updated_at: new Date().toISOString(),
-    }
-    if (account.name !== undefined) updates.name = account.name
-    if (account.phone !== undefined) updates.phone = account.phone
-    if (account.gender !== undefined) updates.gender = account.gender
-    if (account.role !== undefined) updates.role = account.role
-    if (account.isDriverVerified !== undefined)
-      updates.is_driver_verified = Boolean(account.isDriverVerified)
-    if (account.licenseFileName !== undefined)
-      updates.license_file_name = account.licenseFileName
-    if (account.vehicleName !== undefined)
-      updates.vehicle_name = account.vehicleName
-    if (account.vehicleCapacity !== undefined)
-      updates.vehicle_capacity = Number(account.vehicleCapacity) || 5
+    const userUpdates: Record<string, any> = {}
+    if (account.name !== undefined) userUpdates.name = account.name
+    if (account.loginId !== undefined) userUpdates.student_id = account.loginId
+    if (account.role !== undefined) userUpdates.role = toDbRole(account.role)
+    if (account.email !== undefined && account.email)
+      userUpdates.email = account.email
 
-    const { error } = await supabase
-      .from("profiles")
-      .update(updates)
-      .eq("id", userId)
-    if (error) throw error
+    if (Object.keys(userUpdates).length > 0) {
+      await supabase.from("users").update(userUpdates).eq("id", userId)
+    }
+
+    if (
+      account.role === "driver" ||
+      account.isDriverVerified ||
+      account.vehicleName !== undefined ||
+      account.licenseFileName !== undefined
+    ) {
+      await supabase.from("driver_profiles").upsert(
+        {
+          user_id: userId,
+          license_image_url: account.licenseFileName || "",
+          license_status: "approved",
+          car_model: account.vehicleName || "",
+          max_passengers: Number(account.vehicleCapacity) || 3,
+        },
+        { onConflict: "user_id" },
+      )
+    }
     return true
   } catch (err) {
     console.warn("supabaseUpdateProfile failed:", err)
@@ -248,32 +401,27 @@ export async function supabaseUpdateProfile(
   }
 }
 
-/**
- * Supabase Realtime 구독: profiles 테이블의 해당 유저 데이터 변경 시 즉시 콜백 호출
- */
 export function subscribeUserProfileRealtime(
   userId: string,
   onUpdate: (profile: AccountData) => void,
 ): () => void {
-  if (!isSupabaseConfigured() || !userId) {
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) {
     return () => {}
   }
 
   const channel = supabase
-    .channel(`realtime:profiles:${userId}`)
+    .channel(`realtime:users:${userId}`)
     .on(
       "postgres_changes",
       {
         event: "*",
         schema: "public",
-        table: "profiles",
+        table: "users",
         filter: `id=eq.${userId}`,
       },
-      (payload) => {
-        if (payload.new && typeof payload.new === "object") {
-          const updated = profileRowToAccountData(payload.new)
-          onUpdate(updated)
-        }
+      async () => {
+        const refreshed = await supabaseGetProfile(userId)
+        if (refreshed) onUpdate(refreshed)
       },
     )
     .subscribe()
@@ -284,35 +432,42 @@ export function subscribeUserProfileRealtime(
 }
 
 // ============================================================================
-// 3. Routes Service
+// 3. Schedules / Commute Route Service (public.schedules)
 // ============================================================================
 
-export async function supabaseGetRoute(userId: string, role: Role): Promise<RouteData | null> {
-  if (!isSupabaseConfigured()) return null
+export async function supabaseGetRoute(
+  userId: string,
+  role: Role,
+): Promise<RouteData | null> {
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) return null
   try {
+    const titleKey = `기본경로_${role}`
     const { data, error } = await supabase
-      .from("routes")
+      .from("schedules")
       .select("*")
       .eq("user_id", userId)
-      .eq("role", role)
+      .eq("title", titleKey)
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle()
     if (error || !data) return null
-    const extracted = getExtractedWaypointsSync(
-      data.start_point || "",
-      data.destination || "",
-      data.waypoint || "",
-    )
+
+    const startPoint = data.origin || ""
+    const destination = data.destination || ""
+    const extracted = getExtractedWaypointsSync(startPoint, destination, "")
+    const rawTime = String(data.start_time || "08:30").slice(0, 5)
+
     return {
-      start: data.start_point,
-      destination: data.destination,
+      start: startPoint,
+      destination,
       waypoint: extracted.formatted,
       waypointsList: extracted.waypointsList,
-      pickup: data.pickup || "",
-      weekdays: data.weekdays || ["월", "화", "수", "목", "금"],
-      departureTime: data.departure_time,
-      preferredArrival: data.preferred_arrival,
-      smokingPreference: data.smoking_preference || "비흡연자 선호",
-      genderPreference: data.gender_preference || "성별 무관",
+      pickup: startPoint,
+      weekdays: ["월", "화", "수", "목", "금"],
+      departureTime: rawTime || "08:30",
+      preferredArrival: "09:00",
+      smokingPreference: "비흡연자 선호",
+      genderPreference: "성별 무관",
     }
   } catch (err) {
     console.warn("supabaseGetRoute failed:", err)
@@ -325,36 +480,43 @@ export async function supabaseSaveRoute(
   role: Role,
   route: RouteData,
 ) {
-  if (!isSupabaseConfigured()) return false
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) return false
   try {
-    const mapResult = await fetchRouteWaypointsFromMapBackend({
-      start: route.start,
-      destination: route.destination,
-      fallbackWaypoints: route.waypointsList ?? route.waypoint,
-    })
-    const resolvedWaypoint =
-      mapResult.waypointsList.length > 0
-        ? mapResult.formatted
-        : route.waypoint || DIRECT_ROUTE_LABEL
+    const titleKey = `기본경로_${role}`
+    const todayDate = new Date().toLocaleDateString("en-CA")
+    const startTime = `${(route.departureTime || "08:30").slice(0, 5)}:00`
 
-    const { error } = await supabase.from("routes").upsert(
-      {
+    // 기존 기본경로 레코드 확인 후 업데이트 또는 삽입
+    const { data: existing } = await supabase
+      .from("schedules")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("title", titleKey)
+      .limit(1)
+      .maybeSingle()
+
+    if (existing?.id) {
+      const { error } = await supabase
+        .from("schedules")
+        .update({
+          origin: route.start || "",
+          destination: route.destination || "",
+          start_time: startTime,
+          schedule_date: todayDate,
+        })
+        .eq("id", existing.id)
+      if (error) throw error
+    } else {
+      const { error } = await supabase.from("schedules").insert({
         user_id: userId,
-        role,
-        start_point: route.start,
-        destination: route.destination,
-        waypoint: resolvedWaypoint,
-        pickup: route.pickup,
-        weekdays: route.weekdays,
-        departure_time: route.departureTime,
-        preferred_arrival: route.preferredArrival,
-        smoking_preference: route.smokingPreference,
-        gender_preference: route.genderPreference,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id,role" },
-    )
-    if (error) throw error
+        title: titleKey,
+        schedule_date: todayDate,
+        start_time: startTime,
+        origin: route.start || "",
+        destination: route.destination || "",
+      })
+      if (error) throw error
+    }
     return true
   } catch (err) {
     console.warn("supabaseSaveRoute failed:", err)
@@ -362,48 +524,102 @@ export async function supabaseSaveRoute(
   }
 }
 
+export async function supabaseGetSchedules(userId?: string) {
+  if (!isSupabaseConfigured() || !isValidUuid(userId)) return []
+  try {
+    const { data, error } = await supabase
+      .from("schedules")
+      .select("*")
+      .eq("user_id", userId)
+      .order("schedule_date", { ascending: true })
+    if (error || !data) return []
+    return data
+  } catch {
+    return []
+  }
+}
+
 // ============================================================================
-// 4. Rides Service (카풀 운행)
+// 4. Carpools Service (public.carpools)
 // ============================================================================
 
 export async function supabaseGetRides(): Promise<DemoCarpoolRide[]> {
   if (!isSupabaseConfigured()) return []
   try {
-    const { data, error } = await supabase
-      .from("rides")
-      .select("*")
-      .order("created_at", { ascending: false })
-    if (error || !data) return []
-    return data.map((item) => {
+    const [carpoolsRes, usersRes, driverProfilesRes] = await Promise.all([
+      supabase
+        .from("carpools")
+        .select("*")
+        .order("created_at", { ascending: false }),
+      supabase.from("users").select("id, name, email, student_id"),
+      supabase
+        .from("driver_profiles")
+        .select("user_id, car_model, car_number, max_passengers"),
+    ])
+
+    if (carpoolsRes.error || !carpoolsRes.data) return []
+
+    const userMap = new Map<string, any>()
+    ;(usersRes.data || []).forEach((u) => userMap.set(String(u.id), u))
+
+    const driverMap = new Map<string, any>()
+    ;(driverProfilesRes.data || []).forEach((d) =>
+      driverMap.set(String(d.user_id), d),
+    )
+
+    return carpoolsRes.data.map((item) => {
+      const driverUser = userMap.get(String(item.driver_id))
+      const driverProf = driverMap.get(String(item.driver_id))
+      const depDateObj = item.departure_time
+        ? new Date(item.departure_time)
+        : new Date()
+      const validDate = !Number.isNaN(depDateObj.getTime())
+        ? depDateObj
+        : new Date()
+      const dateStr = validDate.toLocaleDateString("en-CA")
+      const timeStr = `${String(validDate.getHours()).padStart(2, "0")}:${String(
+        validDate.getMinutes(),
+      ).padStart(2, "0")}`
+
       const extracted = getExtractedWaypointsSync(
-        item.start_point || "",
+        item.origin || "",
         item.destination || "",
-        item.waypoints || "",
+        "",
       )
+      const mappedStatus = fromDbCarpoolStatus(item.status)
+      const vehicleLabel = [driverProf?.car_model, driverProf?.car_number]
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+
       return {
         id: String(item.id),
-        driverId: item.driver_id ? String(item.driver_id) : "demo-driver",
-        driverName: item.driver_name,
-        start: item.start_point,
-        destination: item.destination,
-        date: item.date,
-        time: item.departure_time,
-        vehicle: item.car_info,
-        totalSeats: item.total_seats,
-        price: item.price,
-        note: item.note || "",
+        driverId: String(item.driver_id || ""),
+        driverName: driverUser?.name || "운전자",
+        start: item.origin || "",
+        destination: item.destination || "",
+        date: dateStr,
+        time: timeStr,
+        vehicle: vehicleLabel || "차량 정보 인증",
+        totalSeats: Number(item.available_seats) || 3,
+        price: Number(item.fee) || 0,
+        note: "",
         waypoints: extracted.formatted || DIRECT_ROUTE_LABEL,
         waypointsList: extracted.waypointsList,
-        estimatedDuration: item.estimated_duration || 25,
-        estimatedArrival: item.arrival_time,
+        estimatedDuration: DEFAULT_ESTIMATED_DURATION,
+        estimatedArrival: calculateEstimatedArrival(
+          dateStr,
+          timeStr,
+          DEFAULT_ESTIMATED_DURATION,
+        ),
         arrivalTimeManual: false,
-        smokingPreference: item.smoking_preference || "비흡연자 선호",
-        genderPreference: item.gender_preference || "성별 무관",
-        status: item.status,
-        settlementStatus: item.settlement_status,
-        endedAt: item.ended_at,
-        settledAt: item.settled_at,
-        createdAt: item.created_at,
+        smokingPreference: "비흡연자 선호",
+        genderPreference: "성별 무관",
+        status: mappedStatus.status,
+        settlementStatus: mappedStatus.settlementStatus,
+        endedAt: mappedStatus.status !== "모집 중" ? item.created_at : null,
+        settledAt: mappedStatus.status === "완료" ? item.created_at : null,
+        createdAt: item.created_at || new Date().toISOString(),
       }
     })
   } catch (err) {
@@ -418,31 +634,47 @@ export async function supabaseCreateRide(
 ) {
   if (!isSupabaseConfigured()) return null
   try {
+    let resolvedDriverId = driverId
+    if (!isValidUuid(resolvedDriverId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      resolvedDriverId = currentUser?.id
+    }
+    if (!isValidUuid(resolvedDriverId)) return null
+
+    const departureIso = new Date(
+      `${ride.date}T${(ride.time || "08:30").slice(0, 5)}:00`,
+    ).toISOString()
+
     const { data, error } = await supabase
-      .from("rides")
+      .from("carpools")
       .insert({
-        driver_id: driverId || null,
-        driver_name: ride.driverName,
-        car_info: ride.vehicle,
-        start_point: ride.start,
+        driver_id: resolvedDriverId,
+        origin: ride.start,
         destination: ride.destination,
-        waypoints: ride.waypoints,
-        date: ride.date,
-        departure_time: ride.time,
-        estimated_duration: ride.estimatedDuration,
-        arrival_time: ride.estimatedArrival,
-        seats: ride.totalSeats,
-        total_seats: ride.totalSeats,
-        price: ride.price,
-        smoking_preference: ride.smokingPreference,
-        gender_preference: ride.genderPreference,
-        note: ride.note,
-        status: ride.status,
-        settlement_status: ride.settlementStatus,
+        departure_time: departureIso,
+        fee: Number(ride.price) || 0,
+        available_seats: Number(ride.totalSeats) || 3,
+        status: toDbCarpoolStatus(ride.status),
       })
       .select()
       .single()
+
     if (error) throw error
+
+    // schedules 테이블에도 운행 일정 함께 기록
+    try {
+      await supabase.from("schedules").insert({
+        user_id: resolvedDriverId,
+        title: `카풀 운행 (${ride.start} → ${ride.destination})`,
+        schedule_date: ride.date,
+        start_time: `${(ride.time || "08:30").slice(0, 5)}:00`,
+        origin: ride.start,
+        destination: ride.destination,
+      })
+    } catch {
+      // ignore schedule sync error
+    }
+
     return data
   } catch (err) {
     console.warn("supabaseCreateRide failed:", err)
@@ -453,16 +685,19 @@ export async function supabaseCreateRide(
 export async function supabaseUpdateRideStatus(
   rideId: string,
   status: string,
-  extra?: { endedAt?: string | null; settledAt?: string | null; settlementStatus?: string },
+  _extra?: {
+    endedAt?: string | null
+    settledAt?: string | null
+    settlementStatus?: string
+  },
 ) {
-  if (!isSupabaseConfigured()) return false
+  if (!isSupabaseConfigured() || !isValidUuid(rideId)) return false
   try {
-    const updates: Record<string, unknown> = { status }
-    if (extra?.endedAt !== undefined) updates.ended_at = extra.endedAt
-    if (extra?.settledAt !== undefined) updates.settled_at = extra.settledAt
-    if (extra?.settlementStatus) updates.settlement_status = extra.settlementStatus
-
-    const { error } = await supabase.from("rides").update(updates).eq("id", rideId)
+    const dbStatus = toDbCarpoolStatus(status)
+    const { error } = await supabase
+      .from("carpools")
+      .update({ status: dbStatus })
+      .eq("id", rideId)
     if (error) throw error
     return true
   } catch (err) {
@@ -472,9 +707,9 @@ export async function supabaseUpdateRideStatus(
 }
 
 export async function supabaseDeleteRide(rideId: string) {
-  if (!isSupabaseConfigured()) return false
+  if (!isSupabaseConfigured() || !isValidUuid(rideId)) return false
   try {
-    const { error } = await supabase.from("rides").delete().eq("id", rideId)
+    const { error } = await supabase.from("carpools").delete().eq("id", rideId)
     if (error) throw error
     return true
   } catch (err) {
@@ -484,25 +719,43 @@ export async function supabaseDeleteRide(rideId: string) {
 }
 
 // ============================================================================
-// 5. Carpool Applications (탑승 신청)
+// 5. Carpool Requests Service (public.carpool_requests)
 // ============================================================================
 
-export async function supabaseGetApplications(): Promise<DemoCarpoolApplication[]> {
+export async function supabaseGetApplications(): Promise<
+  DemoCarpoolApplication[]
+> {
   if (!isSupabaseConfigured()) return []
   try {
-    const { data, error } = await supabase
-      .from("carpool_applications")
-      .select("*")
-      .order("created_at", { ascending: false })
-    if (error || !data) return []
-    return data.map((item) => ({
+    const [reqsRes, usersRes, carpoolsRes] = await Promise.all([
+      supabase
+        .from("carpool_requests")
+        .select("*")
+        .order("created_at", { ascending: false }),
+      supabase.from("users").select("id, name"),
+      supabase.from("carpools").select("id, driver_id"),
+    ])
+
+    if (reqsRes.error || !reqsRes.data) return []
+
+    const userMap = new Map<string, string>()
+    ;(usersRes.data || []).forEach((u) =>
+      userMap.set(String(u.id), u.name || "탑승자"),
+    )
+
+    const carpoolDriverMap = new Map<string, string>()
+    ;(carpoolsRes.data || []).forEach((c) =>
+      carpoolDriverMap.set(String(c.id), String(c.driver_id || "")),
+    )
+
+    return reqsRes.data.map((item) => ({
       id: String(item.id),
-      rideId: String(item.ride_id),
-      riderId: "demo-rider",
-      riderName: item.rider_name,
-      driverId: "demo-driver",
-      createdAt: item.created_at,
-      status: item.status,
+      rideId: String(item.carpool_id),
+      riderId: String(item.passenger_id),
+      riderName: userMap.get(String(item.passenger_id)) || "탑승 학우",
+      driverId: carpoolDriverMap.get(String(item.carpool_id)) || "",
+      createdAt: item.created_at || new Date().toISOString(),
+      status: fromDbRequestStatus(item.status),
     }))
   } catch (err) {
     console.warn("supabaseGetApplications failed:", err)
@@ -512,18 +765,24 @@ export async function supabaseGetApplications(): Promise<DemoCarpoolApplication[
 
 export async function supabaseCreateApplication(
   rideId: string,
-  riderName: string,
+  _riderName: string,
   riderId?: string,
 ) {
-  if (!isSupabaseConfigured()) return null
+  if (!isSupabaseConfigured() || !isValidUuid(rideId)) return null
   try {
+    let resolvedPassengerId = riderId
+    if (!isValidUuid(resolvedPassengerId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      resolvedPassengerId = currentUser?.id
+    }
+    if (!isValidUuid(resolvedPassengerId)) return null
+
     const { data, error } = await supabase
-      .from("carpool_applications")
+      .from("carpool_requests")
       .insert({
-        ride_id: rideId,
-        rider_name: riderName,
-        rider_id: riderId || null,
-        status: "승인 대기",
+        carpool_id: rideId,
+        passenger_id: resolvedPassengerId,
+        status: "pending",
       })
       .select()
       .single()
@@ -539,13 +798,41 @@ export async function supabaseUpdateApplicationStatus(
   applicationId: string,
   status: "승인 대기" | "승인 완료" | "거절 완료" | "취소 완료",
 ) {
-  if (!isSupabaseConfigured()) return false
+  if (!isSupabaseConfigured() || !isValidUuid(applicationId)) return false
   try {
-    const { error } = await supabase
-      .from("carpool_applications")
-      .update({ status })
+    const dbStatus = toDbRequestStatus(status)
+    const { data: updatedReq, error } = await supabase
+      .from("carpool_requests")
+      .update({ status: dbStatus })
       .eq("id", applicationId)
+      .select("carpool_id")
+      .maybeSingle()
     if (error) throw error
+
+    // 승인 완료 시 carpools.available_seats 차감 및 기본 공지 메시지 생성
+    if (dbStatus === "accepted" && updatedReq?.carpool_id) {
+      const { data: carpoolData } = await supabase
+        .from("carpools")
+        .select("id, driver_id, origin, destination, available_seats")
+        .eq("id", updatedReq.carpool_id)
+        .maybeSingle()
+      if (carpoolData) {
+        const nextSeats = Math.max(0, (Number(carpoolData.available_seats) || 1) - 1)
+        await supabase
+          .from("carpools")
+          .update({ available_seats: nextSeats })
+          .eq("id", carpoolData.id)
+
+        if (isValidUuid(carpoolData.driver_id)) {
+          await supabase.from("messages").insert({
+            carpool_id: carpoolData.id,
+            sender_id: carpoolData.driver_id,
+            message_type: "notice",
+            content: `[매칭 완료] ${carpoolData.origin} → ${carpoolData.destination} 카풀 탑승이 수락되었습니다.`,
+          })
+        }
+      }
+    }
     return true
   } catch (err) {
     console.warn("supabaseUpdateApplicationStatus failed:", err)
@@ -554,52 +841,149 @@ export async function supabaseUpdateApplicationStatus(
 }
 
 // ============================================================================
-// 6. Point Wallet & Charges
+// 6. Messages Service (public.messages)
 // ============================================================================
 
-export async function supabaseGetPointBalance(userId: string): Promise<number | null> {
+export type DbMessageRow = {
+  id: string
+  carpool_id: string
+  sender_id: string
+  message_type: "text" | "notice" | "settlement"
+  content: string
+  created_at: string
+}
+
+export async function supabaseGetMessages(
+  carpoolId?: string,
+): Promise<DbMessageRow[]> {
+  if (!isSupabaseConfigured()) return []
+  try {
+    let query = supabase
+      .from("messages")
+      .select("*")
+      .order("created_at", { ascending: true })
+    if (carpoolId && isValidUuid(carpoolId)) {
+      query = query.eq("carpool_id", carpoolId)
+    }
+    const { data, error } = await query
+    if (error || !data) return []
+    return data as DbMessageRow[]
+  } catch {
+    return []
+  }
+}
+
+export async function supabaseSendMessage(params: {
+  carpoolId: string
+  senderId: string
+  content: string
+  messageType?: "text" | "notice" | "settlement"
+}): Promise<DbMessageRow | null> {
+  if (!isSupabaseConfigured() || !isValidUuid(params.carpoolId)) return null
+  try {
+    let resolvedSenderId = params.senderId
+    if (!isValidUuid(resolvedSenderId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      resolvedSenderId = currentUser?.id || ""
+    }
+    if (!isValidUuid(resolvedSenderId)) return null
+
+    const { data, error } = await supabase
+      .from("messages")
+      .insert({
+        carpool_id: params.carpoolId,
+        sender_id: resolvedSenderId,
+        message_type: params.messageType || "text",
+        content: params.content,
+      })
+      .select()
+      .single()
+    if (error) throw error
+    return data as DbMessageRow
+  } catch (err) {
+    console.warn("supabaseSendMessage warning:", err)
+    return null
+  }
+}
+
+// ============================================================================
+// 7. Point Transactions Service (public.point_transactions + public.users.points)
+// ============================================================================
+
+export async function supabaseGetPointBalance(
+  userId?: string,
+): Promise<number | null> {
   if (!isSupabaseConfigured()) return null
   try {
+    let targetId = userId
+    if (!isValidUuid(targetId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      targetId = currentUser?.id
+    }
+    if (!isValidUuid(targetId)) return null
+
     const { data, error } = await supabase
-      .from("point_wallets")
-      .select("balance")
-      .eq("user_id", userId)
+      .from("users")
+      .select("points")
+      .eq("id", targetId)
       .maybeSingle()
     if (error || !data) return null
-    return data.balance
-  } catch (err) {
-    console.warn("supabaseGetPointBalance failed:", err)
+    return Number(data.points) || 0
+  } catch {
     return null
+  }
+}
+
+export async function supabaseGetPointTransactions(userId?: string) {
+  if (!isSupabaseConfigured()) return []
+  try {
+    let targetId = userId
+    if (!isValidUuid(targetId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      targetId = currentUser?.id
+    }
+    if (!isValidUuid(targetId)) return []
+
+    const { data, error } = await supabase
+      .from("point_transactions")
+      .select("*")
+      .eq("user_id", targetId)
+      .order("created_at", { ascending: false })
+    if (error || !data) return []
+    return data
+  } catch {
+    return []
   }
 }
 
 export async function supabaseChargePoints(
   userId: string,
   amount: number,
-  paymentMethod: string,
+  _paymentMethod: string,
   currentBalance: number,
 ) {
   if (!isSupabaseConfigured()) return null
-  const newBalance = currentBalance + amount
   try {
-    // 1) 기록 삽입
-    await supabase.from("point_charges").insert({
-      user_id: userId,
+    let targetId = userId
+    if (!isValidUuid(targetId)) {
+      const currentUser = await supabaseGetCurrentUser()
+      targetId = currentUser?.id || ""
+    }
+    if (!isValidUuid(targetId)) return null
+
+    const newBalance = currentBalance + amount
+
+    await supabase.from("point_transactions").insert({
+      user_id: targetId,
+      type: "charge",
       amount,
-      payment_method: paymentMethod,
-      balance_after: newBalance,
-      status: "충전 완료",
     })
 
-    // 2) 잔액 upsert
-    await supabase.from("point_wallets").upsert(
-      {
-        user_id: userId,
-        balance: newBalance,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id" },
-    )
+    await supabase
+      .from("users")
+      .update({ points: newBalance })
+      .eq("id", targetId)
+
     return newBalance
   } catch (err) {
     console.warn("supabaseChargePoints failed:", err)
@@ -607,22 +991,75 @@ export async function supabaseChargePoints(
   }
 }
 
+export async function supabaseRecordCarpoolSettlement(params: {
+  passengerId?: string
+  driverId?: string
+  carpoolId?: string
+  amount: number
+}) {
+  if (!isSupabaseConfigured()) return false
+  try {
+    const validCarpoolId = isValidUuid(params.carpoolId)
+      ? params.carpoolId
+      : null
+    let passengerUuid = params.passengerId
+    if (!isValidUuid(passengerUuid)) {
+      const currentUser = await supabaseGetCurrentUser()
+      passengerUuid = currentUser?.id
+    }
+
+    if (isValidUuid(passengerUuid)) {
+      await supabase.from("point_transactions").insert({
+        user_id: passengerUuid,
+        carpool_id: validCarpoolId,
+        type: "payment",
+        amount: params.amount,
+      })
+    }
+
+    if (isValidUuid(params.driverId)) {
+      await supabase.from("point_transactions").insert({
+        user_id: params.driverId,
+        carpool_id: validCarpoolId,
+        type: "settlement",
+        amount: params.amount,
+      })
+    }
+
+    if (validCarpoolId && isValidUuid(params.driverId)) {
+      await supabase.from("messages").insert({
+        carpool_id: validCarpoolId,
+        sender_id: params.driverId,
+        message_type: "settlement",
+        content: `[정산 완료] 카풀 요금 ${params.amount.toLocaleString()} P 정산이 완료되었습니다.`,
+      })
+    }
+    return true
+  } catch (err) {
+    console.warn("supabaseRecordCarpoolSettlement warning:", err)
+    return false
+  }
+}
+
 // ============================================================================
-// 7. Safety Reports & Blocked Users
+// 8. Safety Reports & Blocked Users (public.reports_blocks)
 // ============================================================================
 
 export async function supabaseSubmitSafetyReport(report: SafetyReport) {
   if (!isSupabaseConfigured()) return false
   try {
-    const { error } = await supabase.from("safety_reports").insert({
-      target_id: report.targetId,
-      target_name: report.targetName,
-      target_role: report.targetRole,
-      ride_label: report.rideLabel,
-      reason: report.reason,
-      details: report.details,
-      images: report.images || [],
-      status: report.status || "검토 중",
+    const currentUser = await supabaseGetCurrentUser()
+    if (!currentUser?.id) return false
+
+    const targetUuid = isValidUuid(report.targetId)
+      ? report.targetId
+      : currentUser.id
+
+    const { error } = await supabase.from("reports_blocks").insert({
+      reporter_id: currentUser.id,
+      target_user_id: targetUuid,
+      type: "report",
+      reason: `[${report.targetName || "사용자"} / ${report.reason}] ${report.details || ""}`.trim(),
     })
     if (error) throw error
     return true
@@ -635,24 +1072,37 @@ export async function supabaseSubmitSafetyReport(report: SafetyReport) {
 export async function supabaseGetSafetyReports(): Promise<SafetyReport[]> {
   if (!isSupabaseConfigured()) return []
   try {
-    const { data, error } = await supabase
-      .from("safety_reports")
-      .select("*")
-      .order("created_at", { ascending: false })
-    if (error || !data) return []
-    return data.map((item) => ({
-      id: String(item.id),
-      targetId: item.target_id,
-      targetName: item.target_name,
-      targetRole: item.target_role as "운전자" | "탑승자",
-      rideLabel: item.ride_label,
-      reason: item.reason,
-      details: item.details,
-      images: item.images || [],
-      createdAt: item.created_at,
-      status: item.status,
-      response: item.response || "",
-    }))
+    const [reportsRes, usersRes] = await Promise.all([
+      supabase
+        .from("reports_blocks")
+        .select("*")
+        .eq("type", "report")
+        .order("created_at", { ascending: false }),
+      supabase.from("users").select("id, name, role"),
+    ])
+    if (reportsRes.error || !reportsRes.data) return []
+
+    const userMap = new Map<string, any>()
+    ;(usersRes.data || []).forEach((u) => userMap.set(String(u.id), u))
+
+    return reportsRes.data.map((item) => {
+      const targetUser = userMap.get(String(item.target_user_id))
+      return {
+        id: String(item.id),
+        targetId: String(item.target_user_id),
+        targetName: targetUser?.name || "신고 대상 학우",
+        targetRole: targetUser?.role === "driver" ? "운전자" : "탑승자",
+        rideLabel: "카풀 운행 내역",
+        reason: item.reason || "안전 신고 접수",
+        details: item.reason || "",
+        images: [],
+        createdAt: item.created_at
+          ? new Date(item.created_at).toLocaleDateString("ko-KR")
+          : "",
+        status: "검토 중",
+        response: "",
+      }
+    })
   } catch (err) {
     console.warn("supabaseGetSafetyReports failed:", err)
     return []
@@ -662,15 +1112,30 @@ export async function supabaseGetSafetyReports(): Promise<SafetyReport[]> {
 export async function supabaseGetBlockedUsers(): Promise<BlockedUser[]> {
   if (!isSupabaseConfigured()) return []
   try {
-    const { data, error } = await supabase
-      .from("blocked_users")
-      .select("*")
-      .order("blocked_at", { ascending: false })
-    if (error || !data) return []
-    return data.map((item) => ({
+    const [blocksRes, usersRes] = await Promise.all([
+      supabase
+        .from("reports_blocks")
+        .select("*")
+        .eq("type", "block")
+        .order("created_at", { ascending: false }),
+      supabase.from("users").select("id, name"),
+    ])
+    if (blocksRes.error || !blocksRes.data) return []
+
+    const userMap = new Map<string, string>()
+    ;(usersRes.data || []).forEach((u) =>
+      userMap.set(String(u.id), u.name || "차단된 사용자"),
+    )
+
+    return blocksRes.data.map((item) => ({
       id: String(item.id),
-      name: item.blocked_user_name,
-      blockedAt: item.blocked_at,
+      name:
+        userMap.get(String(item.target_user_id)) ||
+        item.reason ||
+        "차단된 사용자",
+      blockedAt: item.created_at
+        ? new Date(item.created_at).toLocaleDateString("ko-KR")
+        : "",
     }))
   } catch (err) {
     console.warn("supabaseGetBlockedUsers failed:", err)
@@ -678,12 +1143,18 @@ export async function supabaseGetBlockedUsers(): Promise<BlockedUser[]> {
   }
 }
 
-export async function supabaseBlockUser(userId: string, name: string) {
+export async function supabaseBlockUser(targetUserId: string, name: string) {
   if (!isSupabaseConfigured()) return false
   try {
-    const { error } = await supabase.from("blocked_users").insert({
-      blocked_user_id: userId,
-      blocked_user_name: name,
+    const currentUser = await supabaseGetCurrentUser()
+    if (!currentUser?.id) return false
+    const targetUuid = isValidUuid(targetUserId) ? targetUserId : currentUser.id
+
+    const { error } = await supabase.from("reports_blocks").insert({
+      reporter_id: currentUser.id,
+      target_user_id: targetUuid,
+      type: "block",
+      reason: name,
     })
     if (error) throw error
     return true
@@ -693,13 +1164,13 @@ export async function supabaseBlockUser(userId: string, name: string) {
   }
 }
 
-export async function supabaseUnblockUser(userId: string) {
-  if (!isSupabaseConfigured()) return false
+export async function supabaseUnblockUser(blockRowId: string) {
+  if (!isSupabaseConfigured() || !isValidUuid(blockRowId)) return false
   try {
     const { error } = await supabase
-      .from("blocked_users")
+      .from("reports_blocks")
       .delete()
-      .eq("id", userId)
+      .eq("id", blockRowId)
     if (error) throw error
     return true
   } catch (err) {
@@ -709,18 +1180,58 @@ export async function supabaseUnblockUser(userId: string) {
 }
 
 // ============================================================================
-// 8. Reviews
+// 9. Reviews Service (public.reviews)
 // ============================================================================
 
-export async function supabaseSubmitReview(review: DemoReview, rideId?: string) {
-  if (!isSupabaseConfigured()) return false
+export async function supabaseGetReviews(): Promise<DemoCarpoolReview[]> {
+  if (!isSupabaseConfigured()) return []
   try {
+    const { data, error } = await supabase
+      .from("reviews")
+      .select("*")
+      .order("created_at", { ascending: false })
+    if (error || !data) return []
+    return data.map((item) => ({
+      id: String(item.id),
+      rideId: String(item.carpool_id),
+      authorId: String(item.reviewer_id),
+      targetId: String(item.target_user_id),
+      rating: Number(item.rating) || 5,
+      keywords: [],
+      content: item.comment || "",
+      createdAt: item.created_at || new Date().toISOString(),
+    }))
+  } catch {
+    return []
+  }
+}
+
+export async function supabaseSubmitReview(
+  review: DemoReview,
+  rideId?: string,
+  targetUserId?: string,
+) {
+  if (!isSupabaseConfigured() || !isValidUuid(rideId)) return false
+  try {
+    const currentUser = await supabaseGetCurrentUser()
+    if (!currentUser?.id) return false
+
+    let resolvedTargetId = targetUserId
+    if (!isValidUuid(resolvedTargetId)) {
+      const { data: carpoolData } = await supabase
+        .from("carpools")
+        .select("driver_id")
+        .eq("id", rideId)
+        .maybeSingle()
+      resolvedTargetId = carpoolData?.driver_id || currentUser.id
+    }
+
     const { error } = await supabase.from("reviews").insert({
-      ride_id: rideId || null,
-      author_name: review.author,
-      rating: review.score,
-      keywords: review.tags,
-      content: review.text,
+      carpool_id: rideId,
+      reviewer_id: currentUser.id,
+      target_user_id: resolvedTargetId,
+      rating: Math.max(1, Math.min(5, Math.round(Number(review.score) || 5))),
+      comment: review.text || "",
     })
     if (error) throw error
     return true

@@ -1,4 +1,8 @@
-import { supabaseChargePoints } from "./supabaseService"
+import {
+  supabaseChargePoints,
+  supabaseGetPointBalance,
+  supabaseGetPointTransactions,
+} from "./supabaseService"
 import { isSupabaseConfigured } from "../lib/supabase"
 
 export type DemoPaymentMethod = "카카오페이" | "토스페이" | "신용카드 간편결제"
@@ -104,9 +108,43 @@ export function chargeDemoPoints(
     charges: [charge, ...snapshot.charges],
   })
   if (isSupabaseConfigured()) {
-    supabaseChargePoints("00000000-0000-0000-0000-000000000001", amount, paymentMethod, snapshot.balance).catch(console.warn)
+    supabaseChargePoints(
+      "",
+      amount,
+      paymentMethod,
+      snapshot.balance - amount,
+    ).catch(console.warn)
   }
   return charge
+}
+
+export async function syncPointWalletWithSupabase(userId?: string) {
+  if (!isSupabaseConfigured()) return
+  try {
+    const [remoteBalance, remoteTxs] = await Promise.all([
+      supabaseGetPointBalance(userId),
+      supabaseGetPointTransactions(userId),
+    ])
+    if (remoteBalance !== null || remoteTxs.length > 0) {
+      let runningBalance = remoteBalance ?? snapshot.balance
+      const mappedCharges: DemoPointCharge[] = remoteTxs
+        .filter((tx: any) => tx.type === "charge")
+        .map((tx: any) => ({
+          id: String(tx.id),
+          amount: Number(tx.amount) || 0,
+          paymentMethod: "카카오페이" as DemoPaymentMethod,
+          createdAt: tx.created_at || new Date().toISOString(),
+          balanceAfter: runningBalance,
+          status: "데모 충전 완료" as const,
+        }))
+      publish({
+        balance: runningBalance,
+        charges: mappedCharges.length > 0 ? mappedCharges : snapshot.charges,
+      })
+    }
+  } catch (err) {
+    console.warn("syncPointWalletWithSupabase warning:", err)
+  }
 }
 
 if (typeof window !== "undefined") {
@@ -115,4 +153,7 @@ if (typeof window !== "undefined") {
     snapshot = readWallet()
     listeners.forEach((listener) => listener())
   })
+  if (isSupabaseConfigured()) {
+    void syncPointWalletWithSupabase()
+  }
 }

@@ -30,7 +30,7 @@ export async function checkSupabaseConnection(): Promise<{
   }
 
   try {
-    const { error } = await supabase.from("profiles").select("id").limit(1)
+    const { error } = await supabase.from("users").select("id").limit(1)
     if (error && error.code !== "PGRST116") {
       return {
         connected: false,
