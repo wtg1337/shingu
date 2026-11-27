@@ -214,6 +214,7 @@ type MatchRide = {
   waypointsList?: string[]
   waypointObjects?: WaypointNode[]
   date: string
+  dateKey?: string
   time: string
   distanceKm: number
   estimatedDuration: number
@@ -243,6 +244,7 @@ const toMatchRide = (ride: Ride): MatchRide => {
     waypointsList: extracted.waypointsList,
     waypointObjects: extracted.waypointObjects,
     distanceKm: extracted.distanceKm,
+    dateKey: today,
     date: new Date().toLocaleDateString("ko-KR", {
       month: "long",
       day: "numeric",
@@ -290,6 +292,7 @@ const toFlowMatchRide = (
     waypointsList: extracted.waypointsList,
     waypointObjects: extracted.waypointObjects,
     distanceKm: extracted.distanceKm,
+    dateKey: String(ride.date || "").slice(0, 10),
     date: new Date(`${ride.date}T00:00:00`).toLocaleDateString("ko-KR", {
       month: "long",
       day: "numeric",
@@ -315,13 +318,23 @@ const toFlowMatchRide = (
 const getVisibleMatchRides = (
   route: RouteData,
   carpoolFlow: DemoCarpoolState,
+  selectedDateKey?: string,
 ) => {
   const preferredArrival = timeLabelToMinutes(route.preferredArrival ?? "")
+  const normalizedTargetDate = (selectedDateKey || "").trim().slice(0, 10)
   return [
     ...carpoolFlow.rides
-      .filter((ride) => ride.status === "모집 중")
+      .filter((ride) => {
+        if (ride.status !== "모집 중") return false
+        if (!normalizedTargetDate) return true
+        return String(ride.date || "").trim().slice(0, 10) === normalizedTargetDate
+      })
       .map((ride) => toFlowMatchRide(ride, carpoolFlow)),
-    ...getDemoMatches(route, rides).map(toMatchRide),
+    ...getDemoMatches(route, rides)
+      .map(toMatchRide)
+      .filter((ride) =>
+        normalizedTargetDate ? ride.dateKey === normalizedTargetDate : true,
+      ),
   ]
     .map((ride) => {
       const arrival = etaTimeToMinutes(ride.estimatedArrival)
@@ -3468,9 +3481,12 @@ function RiderHome({
   const [activeRide, setActiveRide] = useState(0)
   const rideListRef = useRef<HTMLDivElement>(null)
   const matchedRides = useMemo(
-    () => getVisibleMatchRides(route, carpoolFlow),
-    [route, carpoolFlow],
+    () => getVisibleMatchRides(route, carpoolFlow, bookingDate),
+    [route, carpoolFlow, bookingDate],
   )
+  useEffect(() => {
+    setActiveRide(0)
+  }, [bookingDate])
   const myRiderId = (account?.id || account?.loginId || "").trim()
   const riderApplications = useMemo(
     () =>
@@ -6270,6 +6286,7 @@ function SheetView({
   open,
   role,
   route,
+  bookingDate,
   account,
   selectedBadges,
   tripFlow,
@@ -6293,6 +6310,7 @@ function SheetView({
   open: (sheet: Sheet) => void
   role: Role
   route: RouteData
+  bookingDate: string
   account: AccountData
   selectedBadges: Record<Role, string[]>
   tripFlow: DemoTripFlow
@@ -6758,7 +6776,7 @@ function SheetView({
   const latestApplicationRide = latestApplication
     ? carpoolFlow.rides.find((item) => item.id === latestApplication.rideId)
     : undefined
-  const sheetMatches = getVisibleMatchRides(route, carpoolFlow)
+  const sheetMatches = getVisibleMatchRides(route, carpoolFlow, bookingDate)
   const detailRide = selectedRide ?? sheetMatches[0]
 
   const [detailWaypoints, setDetailWaypoints] = useState<string[]>(
@@ -7284,11 +7302,11 @@ function SheetView({
         {type === "matches" && (
           <div className="sheet-content">
             <div className="demo-banner">
-              <Sparkles />
+              <CalendarDays />
               <p>
-                <strong>데모 경로 유사도</strong>
-                지도 API가 연결되지 않아 저장된 출발지, 목적지, 경유지와 시간을
-                비교한 결과예요.
+                <strong>{formatBookingDateLabel(bookingDate)} 기준 카풀</strong>
+                선택한 날짜에 운전자가 등록한 모집 중 카풀을 경로·시간 순으로
+                보여드려요.
               </p>
             </div>
             {sheetMatches.length > 0 ? (
@@ -7336,7 +7354,9 @@ function SheetView({
                         <i />
                         <span>
                           <strong>{ride.start}</strong>
-                          <small>5월 20일 · {ride.time}</small>
+                          <small>
+                            {ride.date} · {ride.time}
+                          </small>
                         </span>
                       </div>
                       <div className="via">
@@ -7418,8 +7438,12 @@ function SheetView({
             ) : (
               <div className="recommendation-empty">
                 <Route />
-                <strong>조건에 맞는 카풀이 없어요</strong>
-                <p>기본 경로나 희망 시간을 조정한 뒤 다시 검색해 주세요.</p>
+                <strong>
+                  {formatBookingDateLabel(bookingDate)}에 등록된 카풀이 없어요
+                </strong>
+                <p>
+                  다른 날짜를 선택하거나 기본 경로·희망 시간을 조정해 보세요.
+                </p>
                 <Button variant="soft" onClick={() => open("route-edit")}>
                   추천 조건 수정
                 </Button>
@@ -12177,6 +12201,7 @@ export default function App() {
           open={handleOpenSheet}
           role={role}
           route={routesByRole[role]}
+          bookingDate={bookingDate}
           account={account}
           selectedBadges={selectedBadges}
           tripFlow={tripFlow}
