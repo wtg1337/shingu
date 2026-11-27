@@ -150,8 +150,12 @@ import {
 } from "./services/supabaseService"
 import {
   DIRECT_ROUTE_LABEL,
+  fetchRouteMetrics,
   fetchRouteWaypointsFromMapBackend,
+  formatRouteMetricsSummary,
   getExtractedWaypointsSync,
+  getRouteMetricsSync,
+  type RouteMetricsSummary,
   type WaypointNode,
 } from "./services/routeWaypointService"
 import {
@@ -211,6 +215,7 @@ type MatchRide = {
   waypointObjects?: WaypointNode[]
   date: string
   time: string
+  distanceKm: number
   estimatedDuration: number
   estimatedArrival: string
   seats: number
@@ -237,14 +242,17 @@ const toMatchRide = (ride: Ride): MatchRide => {
     via: extracted.formatted || DIRECT_ROUTE_LABEL,
     waypointsList: extracted.waypointsList,
     waypointObjects: extracted.waypointObjects,
+    distanceKm: extracted.distanceKm,
     date: new Date().toLocaleDateString("ko-KR", {
       month: "long",
       day: "numeric",
     }),
+    estimatedDuration:
+      ride.estimatedDuration || extracted.estimatedDurationMinutes,
     estimatedArrival: calculateEstimatedArrival(
       today,
       departureTime,
-      ride.estimatedDuration,
+      ride.estimatedDuration || extracted.estimatedDurationMinutes,
     ),
   }
 }
@@ -281,13 +289,21 @@ const toFlowMatchRide = (
     via: extracted.formatted || DIRECT_ROUTE_LABEL,
     waypointsList: extracted.waypointsList,
     waypointObjects: extracted.waypointObjects,
+    distanceKm: extracted.distanceKm,
     date: new Date(`${ride.date}T00:00:00`).toLocaleDateString("ko-KR", {
       month: "long",
       day: "numeric",
     }),
     time: ride.time,
-    estimatedDuration: ride.estimatedDuration,
-    estimatedArrival: ride.estimatedArrival,
+    estimatedDuration:
+      ride.estimatedDuration || extracted.estimatedDurationMinutes,
+    estimatedArrival:
+      ride.estimatedArrival ||
+      calculateEstimatedArrival(
+        ride.date,
+        ride.time,
+        ride.estimatedDuration || extracted.estimatedDurationMinutes,
+      ),
     seats: getRemainingSeats(carpoolFlow, ride.id),
     price: ride.price,
     match: 99,
@@ -3260,10 +3276,22 @@ function RouteCard({
   const [waypoints, setWaypoints] = useState<string[]>(
     syncExtracted.waypointsList || [],
   )
+  const [routeMetrics, setRouteMetrics] = useState<RouteMetricsSummary>({
+    distanceKm: syncExtracted.distanceKm,
+    estimatedDurationMinutes: syncExtracted.estimatedDurationMinutes,
+    fromCache: syncExtracted.fromCache,
+    fallbackUsed: syncExtracted.fallbackUsed,
+  })
   const [waypointLoading, setWaypointLoading] = useState(false)
 
   useEffect(() => {
     setWaypoints(syncExtracted.waypointsList || [])
+    setRouteMetrics({
+      distanceKm: syncExtracted.distanceKm,
+      estimatedDurationMinutes: syncExtracted.estimatedDurationMinutes,
+      fromCache: syncExtracted.fromCache,
+      fallbackUsed: syncExtracted.fallbackUsed,
+    })
     const s = (route?.start || "").trim()
     const d = (route?.destination || "").trim()
     if (!s || !d) {
@@ -3280,9 +3308,24 @@ function RouteCard({
       .then((res) => {
         if (cancelled) return
         setWaypoints(Array.isArray(res?.waypointsList) ? res.waypointsList : [])
+        setRouteMetrics({
+          distanceKm: res?.distanceKm ?? syncExtracted.distanceKm,
+          estimatedDurationMinutes:
+            res?.estimatedDurationMinutes ??
+            syncExtracted.estimatedDurationMinutes,
+          fromCache: res?.fromCache,
+          fallbackUsed: res?.fallbackUsed,
+        })
       })
       .catch(() => {
-        if (!cancelled) setWaypoints(syncExtracted.waypointsList || [])
+        if (!cancelled) {
+          setWaypoints(syncExtracted.waypointsList || [])
+          setRouteMetrics({
+            distanceKm: syncExtracted.distanceKm,
+            estimatedDurationMinutes: syncExtracted.estimatedDurationMinutes,
+            fallbackUsed: true,
+          })
+        }
       })
       .finally(() => {
         if (!cancelled) setWaypointLoading(false)
@@ -3296,6 +3339,10 @@ function RouteCard({
     route?.waypoint,
     route?.waypointsList,
     syncExtracted.waypointsList,
+    syncExtracted.distanceKm,
+    syncExtracted.estimatedDurationMinutes,
+    syncExtracted.fromCache,
+    syncExtracted.fallbackUsed,
   ])
 
   const hasValidEndpoints = Boolean(
@@ -3310,7 +3357,24 @@ function RouteCard({
 
   const arrivalTimeDisplay =
     route?.preferredArrival ||
-    addMinutesToTime24(route?.departureTime || "08:30", 30)
+    addMinutesToTime24(
+      route?.departureTime || "08:30",
+      routeMetrics.estimatedDurationMinutes || 30,
+    )
+  const todayIso = new Date().toLocaleDateString("en-CA", {
+    timeZone: "Asia/Seoul",
+  })
+  const calculatedEtaIso = hasValidEndpoints
+    ? calculateEstimatedArrival(
+        todayIso,
+        route?.departureTime || "08:30",
+        routeMetrics.estimatedDurationMinutes,
+      )
+    : ""
+  const routeMetricsLabel = formatRouteMetricsSummary(
+    routeMetrics.distanceKm,
+    routeMetrics.estimatedDurationMinutes,
+  )
 
   return (
     <div className={`route-card ${small ? "route-card--small" : ""}`}>
@@ -3341,6 +3405,13 @@ function RouteCard({
         {hasValidEndpoints && (
           <div className="route-card__waypoints">
             <small>주요 경유지 · {waypointSummary}</small>
+            <div className="route-metrics-badge" aria-label="예상 이동 거리 및 소요 시간">
+              <Navigation />
+              <span>
+                {routeMetricsLabel}
+                {calculatedEtaIso ? ` · ${formatEtaTime(calculatedEtaIso)} 도착 예정` : ""}
+              </span>
+            </div>
           </div>
         )}
         <div>
@@ -3670,7 +3741,10 @@ function RiderHome({
                         {formatEtaTime(ride.estimatedArrival)} 도착 예정
                       </strong>
                     </span>
-                    <small>약 {ride.estimatedDuration}분</small>
+                    <small>
+                      예상 거리 {ride.distanceKm.toFixed(1)}km · 약{" "}
+                      {ride.estimatedDuration}분
+                    </small>
                   </div>
                   <div className="ride-bottom">
                     <span>
@@ -3759,8 +3833,14 @@ function RiderHome({
                 {latestApplicationRide.price.toLocaleString()} P
               </small>
               <small className="eta-inline">
-                {formatEtaTime(latestApplicationRide.estimatedArrival)} 도착 예정
-                · 약 {latestApplicationRide.estimatedDuration}분
+                {formatRouteMetricsSummary(
+                  getRouteMetricsSync(
+                    latestApplicationRide.start,
+                    latestApplicationRide.destination,
+                  ).distanceKm,
+                  latestApplicationRide.estimatedDuration,
+                )}{" "}
+                · {formatEtaTime(latestApplicationRide.estimatedArrival)} 도착 예정
               </small>
               <span
                 className="clickable-profile-inline"
@@ -3924,7 +4004,13 @@ function DriverHome({
               <small>등록 일정 기준 도착 예정</small>
               <strong>{formatEtaTime(newestRide.estimatedArrival)}</strong>
             </span>
-            <b>약 {newestRide.estimatedDuration}분</b>
+            <b>
+              {getRouteMetricsSync(
+                newestRide.start,
+                newestRide.destination,
+              ).distanceKm.toFixed(1)}
+              km · 약 {newestRide.estimatedDuration}분
+            </b>
           </div>
           <p>
             승인{" "}
@@ -4539,8 +4625,11 @@ function SchedulePage({
                   {getRemainingSeats(carpoolFlow, ride.id)}석
                 </small>
                 <small className="eta-inline">
-                  {formatEtaTime(ride.estimatedArrival)} 도착 예정 · 약{" "}
-                  {ride.estimatedDuration}분
+                  {formatRouteMetricsSummary(
+                    getRouteMetricsSync(ride.start, ride.destination).distanceKm,
+                    ride.estimatedDuration,
+                  )}{" "}
+                  · {formatEtaTime(ride.estimatedArrival)} 도착 예정
                 </small>
               </article>
             )
@@ -4650,8 +4739,13 @@ function SchedulePage({
                       {ride.price.toLocaleString()} P
                     </p>
                     <p className="eta-event">
-                      <Clock3 /> {formatEtaTime(ride.estimatedArrival)} 도착 예정
-                      · 약 {ride.estimatedDuration}분
+                      <Clock3 />{" "}
+                      {formatRouteMetricsSummary(
+                        getRouteMetricsSync(ride.start, ride.destination)
+                          .distanceKm,
+                        ride.estimatedDuration,
+                      )}{" "}
+                      · {formatEtaTime(ride.estimatedArrival)} 도착 예정
                     </p>
                     {ride.status === "완료" && role === "rider" && (
                       <small>
@@ -6670,13 +6764,44 @@ function SheetView({
   const [detailWaypoints, setDetailWaypoints] = useState<string[]>(
     () => detailRide?.waypointsList || [],
   )
+  const [detailMetrics, setDetailMetrics] = useState<RouteMetricsSummary>(() =>
+    getRouteMetricsSync(detailRide?.start || "", detailRide?.end || ""),
+  )
   const [detailWaypointsLoading, setDetailWaypointsLoading] = useState(false)
   const [createWaypointsList, setCreateWaypointsList] = useState<string[]>([])
+  const [createRouteMetrics, setCreateRouteMetrics] =
+    useState<RouteMetricsSummary>(() =>
+      getRouteMetricsSync(createDraft.start, createDraft.destination),
+    )
   const [createWaypointsLoading, setCreateWaypointsLoading] = useState(false)
   const [routeWaypointsList, setRouteWaypointsList] = useState<string[]>(
     () => route?.waypointsList || [],
   )
+  const [routeEditMetrics, setRouteEditMetrics] = useState<RouteMetricsSummary>(
+    () => getRouteMetricsSync(routeDraft.start, routeDraft.destination),
+  )
   const [routeWaypointsLoading, setRouteWaypointsLoading] = useState(false)
+
+  useEffect(() => {
+    if (type !== "matches" || sheetMatches.length === 0) return
+    let cancelled = false
+    const uncachedPairs = sheetMatches
+      .slice(0, 6)
+      .filter((item) => item.start && item.end)
+    uncachedPairs.forEach((item) => {
+      void fetchRouteMetrics({
+        start: item.start,
+        destination: item.end,
+      }).catch(() => {
+        if (!cancelled) {
+          // 폴백 값 유지
+        }
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [type, sheetMatches.length])
 
   useEffect(() => {
     if (type !== "ride" || !detailRide) return
@@ -6686,6 +6811,13 @@ function SheetView({
       detailRide.waypointsList ?? detailRide.via,
     )
     setDetailWaypoints(syncRes.waypointsList || [])
+    setDetailMetrics({
+      distanceKm: syncRes.distanceKm,
+      estimatedDurationMinutes:
+        detailRide.estimatedDuration || syncRes.estimatedDurationMinutes,
+      fromCache: syncRes.fromCache,
+      fallbackUsed: syncRes.fallbackUsed,
+    })
     let cancelled = false
     setDetailWaypointsLoading(true)
     fetchRouteWaypointsFromMapBackend({
@@ -6698,9 +6830,26 @@ function SheetView({
         setDetailWaypoints(
           Array.isArray(res?.waypointsList) ? res.waypointsList : [],
         )
+        setDetailMetrics({
+          distanceKm: res?.distanceKm ?? syncRes.distanceKm,
+          estimatedDurationMinutes:
+            res?.estimatedDurationMinutes ??
+            detailRide.estimatedDuration ??
+            syncRes.estimatedDurationMinutes,
+          fromCache: res?.fromCache,
+          fallbackUsed: res?.fallbackUsed,
+        })
       })
       .catch(() => {
-        if (!cancelled) setDetailWaypoints(syncRes.waypointsList || [])
+        if (!cancelled) {
+          setDetailWaypoints(syncRes.waypointsList || [])
+          setDetailMetrics({
+            distanceKm: syncRes.distanceKm,
+            estimatedDurationMinutes:
+              detailRide.estimatedDuration || syncRes.estimatedDurationMinutes,
+            fallbackUsed: true,
+          })
+        }
       })
       .finally(() => {
         if (!cancelled) setDetailWaypointsLoading(false)
@@ -6719,6 +6868,8 @@ function SheetView({
       setCreateWaypointsLoading(false)
       return
     }
+    const syncMetrics = getRouteMetricsSync(s, d)
+    setCreateRouteMetrics(syncMetrics)
     let cancelled = false
     setCreateWaypointsLoading(true)
     const timer = window.setTimeout(() => {
@@ -6733,6 +6884,14 @@ function SheetView({
             ? res.waypointsList
             : []
           setCreateWaypointsList(safeList)
+          setCreateRouteMetrics({
+            distanceKm: res?.distanceKm ?? syncMetrics.distanceKm,
+            estimatedDurationMinutes:
+              res?.estimatedDurationMinutes ??
+              syncMetrics.estimatedDurationMinutes,
+            fromCache: res?.fromCache,
+            fallbackUsed: res?.fallbackUsed,
+          })
           setCreateDraft((prev) => ({
             ...prev,
             waypoints: res?.formatted || DIRECT_ROUTE_LABEL,
@@ -6763,6 +6922,8 @@ function SheetView({
       setRouteWaypointsLoading(false)
       return
     }
+    const syncMetrics = getRouteMetricsSync(s, d)
+    setRouteEditMetrics(syncMetrics)
     let cancelled = false
     setRouteWaypointsLoading(true)
     const timer = window.setTimeout(() => {
@@ -6777,6 +6938,14 @@ function SheetView({
             ? res.waypointsList
             : []
           setRouteWaypointsList(safeList)
+          setRouteEditMetrics({
+            distanceKm: res?.distanceKm ?? syncMetrics.distanceKm,
+            estimatedDurationMinutes:
+              res?.estimatedDurationMinutes ??
+              syncMetrics.estimatedDurationMinutes,
+            fromCache: res?.fromCache,
+            fallbackUsed: res?.fallbackUsed,
+          })
           setRouteDraft((prev) => ({
             ...prev,
             waypoint: res?.formatted || DIRECT_ROUTE_LABEL,
@@ -7196,7 +7365,8 @@ function SheetView({
                         </strong>
                       </span>
                       <small>
-                        약 {ride.estimatedDuration}분 · 잔여 {ride.seats}석
+                        {ride.distanceKm.toFixed(1)}km · 약{" "}
+                        {ride.estimatedDuration}분 · 잔여 {ride.seats}석
                       </small>
                     </div>
                     <div className="ride-bottom">
@@ -7332,8 +7502,13 @@ function SheetView({
               <div>
                 <Clock3 />
                 <span>
-                  예상 소요 시간
-                  <strong>약 {detailRide.estimatedDuration}분</strong>
+                  예상 거리 · 소요 시간
+                  <strong>
+                    {detailMetrics.distanceKm.toFixed(1)}km · 약{" "}
+                    {detailMetrics.estimatedDurationMinutes ||
+                      detailRide.estimatedDuration}
+                    분
+                  </strong>
                 </span>
               </div>
               <div>
@@ -7617,10 +7792,13 @@ function SheetView({
                     : "날짜와 출발 시간을 입력해 주세요"}
                 </strong>
                 <small>
-                  예상 소요 시간 약{" "}
-                  {Number(createDraft.estimatedDuration) ||
-                    DEFAULT_ESTIMATED_DURATION}
-                  분 · 실제 교통정보 미반영
+                  {formatRouteMetricsSummary(
+                    createRouteMetrics.distanceKm,
+                    Number(createDraft.estimatedDuration) ||
+                      createRouteMetrics.estimatedDurationMinutes ||
+                      DEFAULT_ESTIMATED_DURATION,
+                  )}{" "}
+                  · 도로 경로 기준
                 </small>
               </div>
             </div>
@@ -9172,6 +9350,28 @@ function SheetView({
                   ))}
                 </div>
               )
+            )}
+            {routeDraft.start.trim() && routeDraft.destination.trim() && (
+              <div className="route-metrics-badge route-metrics-badge--sheet">
+                <Navigation />
+                <span>
+                  {formatRouteMetricsSummary(
+                    routeEditMetrics.distanceKm,
+                    routeEditMetrics.estimatedDurationMinutes,
+                  )}
+                  {(() => {
+                    const todayKey = new Date().toLocaleDateString("en-CA", {
+                      timeZone: "Asia/Seoul",
+                    })
+                    const eta = calculateEstimatedArrival(
+                      todayKey,
+                      routeDraft.departureTime || "08:30",
+                      routeEditMetrics.estimatedDurationMinutes,
+                    )
+                    return eta ? ` · ${formatEtaTime(eta)} 도착 예정` : ""
+                  })()}
+                </span>
+              </div>
             )}
             <div className="field">
               <span>희망 출발 시간대</span>

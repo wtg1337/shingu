@@ -24,8 +24,58 @@ export type RouteWaypointExtractionResult = {
   fallbackUsed?: boolean
 }
 
+export type RouteMetricsSummary = {
+  distanceKm: number
+  estimatedDurationMinutes: number
+  fromCache?: boolean
+  fallbackUsed?: boolean
+}
+
 const WAYPOINT_CACHE_KEY = "shingu-route-waypoints-cache-v1"
 export const DIRECT_ROUTE_LABEL = "직행 (경유지 없음)"
+const inFlightRouteRequests = new Map<
+  string,
+  Promise<RouteWaypointExtractionResult>
+>()
+
+function estimateFallbackMetricsFromCoords(
+  startCoord: GeoCoord,
+  endCoord: GeoCoord,
+): { distanceKm: number; estimatedDurationMinutes: number } {
+  const straightDistKm = haversineDistanceKm(startCoord, endCoord)
+  if (straightDistKm < 0.35) {
+    return {
+      distanceKm: Number(Math.max(0.1, straightDistKm).toFixed(1)),
+      estimatedDurationMinutes: 5,
+    }
+  }
+  return {
+    distanceKm: Number((straightDistKm * 1.28).toFixed(1)),
+    estimatedDurationMinutes: Math.max(
+      8,
+      Math.min(90, Math.round(straightDistKm * 3.2 + 6)),
+    ),
+  }
+}
+
+export function formatRouteMetricsSummary(
+  distanceKm?: number | null,
+  estimatedDurationMinutes?: number | null,
+): string {
+  const safeDistance =
+    typeof distanceKm === "number" &&
+    Number.isFinite(distanceKm) &&
+    distanceKm > 0
+      ? distanceKm
+      : 5.0
+  const safeDuration =
+    typeof estimatedDurationMinutes === "number" &&
+    Number.isFinite(estimatedDurationMinutes) &&
+    estimatedDurationMinutes > 0
+      ? Math.round(estimatedDurationMinutes)
+      : 20
+  return `예상 거리 ${safeDistance.toFixed(1)}km · 예상 소요 ${safeDuration}분`
+}
 
 // 단순 내비게이션 안내 문구 필터링 정규식
 const NAVIGATION_NOISE_PATTERNS = [
@@ -384,7 +434,7 @@ function extractHubsAlongCorridor(
   return selected
 }
 
-// 동기식 즉시 경유지 조회 (초기 렌더링, 카드 목록, 폴백용)
+// 동기식 즉시 경유지 및 예상 거리·소요시간 조회 (초기 렌더링, 카드 목록, 폴백용)
 export function getExtractedWaypointsSync(
   start: string,
   destination: string,
@@ -393,6 +443,10 @@ export function getExtractedWaypointsSync(
   waypointsList: string[]
   waypointObjects: WaypointNode[]
   formatted: string
+  distanceKm: number
+  estimatedDurationMinutes: number
+  fromCache?: boolean
+  fallbackUsed?: boolean
 } {
   const cleanStart = (start || "").trim()
   const cleanDest = (destination || "").trim()
@@ -402,6 +456,18 @@ export function getExtractedWaypointsSync(
     const cacheKey = makeCacheKey(cleanStart, cleanDest)
     const cached = readWaypointCache()[cacheKey]
     if (cached && Array.isArray(cached.waypointsList)) {
+      const safeDistance =
+        typeof cached.distanceKm === "number" &&
+        Number.isFinite(cached.distanceKm) &&
+        cached.distanceKm > 0
+          ? Number(cached.distanceKm.toFixed(1))
+          : 5.0
+      const safeDuration =
+        typeof cached.estimatedDurationMinutes === "number" &&
+        Number.isFinite(cached.estimatedDurationMinutes) &&
+        cached.estimatedDurationMinutes > 0
+          ? Math.round(cached.estimatedDurationMinutes)
+          : 20
       return {
         waypointsList: cached.waypointsList,
         waypointObjects: Array.isArray(cached.waypointObjects)
@@ -411,11 +477,18 @@ export function getExtractedWaypointsSync(
           cached.waypointsList.length > 0
             ? cached.waypointsList.join(" · ")
             : DIRECT_ROUTE_LABEL,
+        distanceKm: safeDistance,
+        estimatedDurationMinutes: safeDuration,
+        fromCache: true,
+        fallbackUsed: cached.fallbackUsed,
       }
     }
   }
 
-  // 2) 출발지·목적지가 모두 있으면 지리 코리도 기반 실제 거점 즉시 계산
+  let fallbackDistanceKm = 5.0
+  let fallbackDurationMinutes = 20
+
+  // 2) 출발지·목적지가 모두 있으면 지리 코리도 기반 실제 거점 및 거리·시간 즉시 계산
   if (cleanStart && cleanDest) {
     const startNorm = normalizePlaceName(cleanStart)
     const destNorm = normalizePlaceName(cleanDest)
@@ -433,6 +506,10 @@ export function getExtractedWaypointsSync(
     )
 
     if (startHub && endHub) {
+      const estimated = estimateFallbackMetricsFromCoords(startHub, endHub)
+      fallbackDistanceKm = estimated.distanceKm
+      fallbackDurationMinutes = estimated.estimatedDurationMinutes
+
       const corridorHubs = extractHubsAlongCorridor(
         cleanStart,
         cleanDest,
@@ -445,6 +522,9 @@ export function getExtractedWaypointsSync(
           waypointsList: list,
           waypointObjects: corridorHubs,
           formatted: list.join(" · "),
+          distanceKm: fallbackDistanceKm,
+          estimatedDurationMinutes: fallbackDurationMinutes,
+          fallbackUsed: true,
         }
       }
     }
@@ -470,6 +550,9 @@ export function getExtractedWaypointsSync(
       waypointsList: filteredSaved.slice(0, 4),
       waypointObjects: objects.slice(0, 4),
       formatted: filteredSaved.slice(0, 4).join(" · "),
+      distanceKm: fallbackDistanceKm,
+      estimatedDurationMinutes: fallbackDurationMinutes,
+      fallbackUsed: true,
     }
   }
 
@@ -477,16 +560,34 @@ export function getExtractedWaypointsSync(
     waypointsList: [],
     waypointObjects: [],
     formatted: DIRECT_ROUTE_LABEL,
+    distanceKm: fallbackDistanceKm,
+    estimatedDurationMinutes: fallbackDurationMinutes,
+    fallbackUsed: true,
   }
 }
 
-// 비동기 백엔드 지도/경로 탐색 API 기반 실제 경유지 추출 (OSRM + 지오코딩 + 코리도 정제)
+// 동기식 예상 거리(km)·소요 시간(분) 요약 조회 (지도 UI 없이 텍스트/배지 바인딩용)
+export function getRouteMetricsSync(
+  start: string,
+  destination: string,
+): RouteMetricsSummary {
+  const sync = getExtractedWaypointsSync(start, destination)
+  return {
+    distanceKm: sync.distanceKm,
+    estimatedDurationMinutes: sync.estimatedDurationMinutes,
+    fromCache: sync.fromCache,
+    fallbackUsed: sync.fallbackUsed,
+  }
+}
+
+// 비동기 경로 탐색 API 기반 실제 거리·소요시간·경유지 추출 (OSRM + 지오코딩 + 코리도 정제)
 export async function fetchRouteWaypointsFromMapBackend(params: {
   start: string
   destination: string
   startCoord?: Partial<GeoCoord> | null
   endCoord?: Partial<GeoCoord> | null
   fallbackWaypoints?: string | string[] | null
+  metricsOnly?: boolean
 }): Promise<RouteWaypointExtractionResult> {
   const cleanStart = (params.start || "").trim()
   const cleanDest = (params.destination || "").trim()
@@ -505,184 +606,245 @@ export async function fetchRouteWaypointsFromMapBackend(params: {
       waypointsList: fallback.waypointsList,
       waypointObjects: fallback.waypointObjects,
       formatted: fallback.formatted,
-      estimatedDurationMinutes: 20,
-      distanceKm: 5,
+      estimatedDurationMinutes: fallback.estimatedDurationMinutes || 20,
+      distanceKm: fallback.distanceKm || 5,
       fallbackUsed: true,
     }
   }
 
   const cacheKey = makeCacheKey(cleanStart, cleanDest)
   const cached = readWaypointCache()[cacheKey]
-  if (cached && Array.isArray(cached.waypointsList)) {
+  if (
+    cached &&
+    Array.isArray(cached.waypointsList) &&
+    typeof cached.distanceKm === "number" &&
+    typeof cached.estimatedDurationMinutes === "number"
+  ) {
     return { ...cached, fromCache: true }
   }
 
-  try {
-    const [startCoord, endCoord] = await Promise.all([
-      geocodePlaceToCoord(cleanStart, params.startCoord),
-      geocodePlaceToCoord(cleanDest, params.endCoord),
-    ])
+  const inflightKey = `${cacheKey}:${params.metricsOnly ? "metrics" : "full"}`
+  const existingRequest = inFlightRouteRequests.get(inflightKey)
+  if (existingRequest) {
+    return existingRequest
+  }
 
-    if (!isValidCoord(startCoord) || !isValidCoord(endCoord)) {
-      throw new Error("유효한 출발지·목적지 좌표를 확인할 수 없습니다.")
-    }
+  const requestPromise = (async (): Promise<RouteWaypointExtractionResult> => {
+    try {
+      const [startCoord, endCoord] = await Promise.all([
+        geocodePlaceToCoord(cleanStart, params.startCoord),
+        geocodePlaceToCoord(cleanDest, params.endCoord),
+      ])
 
-    const straightDistKm = haversineDistanceKm(startCoord, endCoord)
-    if (
-      straightDistKm < 0.35 ||
-      normalizePlaceName(cleanStart) === normalizePlaceName(cleanDest)
-    ) {
-      const directResult: RouteWaypointExtractionResult = {
+      if (!isValidCoord(startCoord) || !isValidCoord(endCoord)) {
+        throw new Error("유효한 출발지·목적지 좌표를 확인할 수 없습니다.")
+      }
+
+      const straightDistKm = haversineDistanceKm(startCoord, endCoord)
+      if (
+        straightDistKm < 0.35 ||
+        normalizePlaceName(cleanStart) === normalizePlaceName(cleanDest)
+      ) {
+        const directResult: RouteWaypointExtractionResult = {
+          start: cleanStart,
+          destination: cleanDest,
+          startCoord,
+          endCoord,
+          waypointsList: [],
+          waypointObjects: [],
+          formatted: DIRECT_ROUTE_LABEL,
+          estimatedDurationMinutes: 5,
+          distanceKm: Number(Math.max(0.1, straightDistKm).toFixed(1)),
+          fallbackUsed: false,
+        }
+        writeWaypointCache(cacheKey, directResult)
+        return directResult
+      }
+
+      const fallbackMetrics = estimateFallbackMetricsFromCoords(
+        startCoord,
+        endCoord,
+      )
+      const precomputedHubs = extractHubsAlongCorridor(
+        cleanStart,
+        cleanDest,
+        startCoord,
+        endCoord,
+      )
+      // 거리·시간만 필요하거나 기존 거점 코리도로 이미 주요 경유지가 충분하면 경량 OSRM 옵션 사용
+      const useLightweightOsrm =
+        Boolean(params.metricsOnly) || precomputedHubs.length >= 2
+
+      let pathCoords: GeoCoord[] = []
+      let osrmStepRoadNames: string[] = []
+      let durationMinutes = fallbackMetrics.estimatedDurationMinutes
+      let roadDistanceKm = fallbackMetrics.distanceKm
+      let osrmSucceeded = false
+
+      // 실제 라우팅 API (OSRM Driving Route API) 호출 - 타임아웃 및 예외 방어
+      try {
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => controller.abort(), 2800)
+        const queryOptions = useLightweightOsrm
+          ? "overview=false&steps=false"
+          : "overview=simplified&geometries=geojson&steps=true"
+        const url = `https://router.project-osrm.org/route/v1/driving/${startCoord.lng},${startCoord.lat};${endCoord.lng},${endCoord.lat}?${queryOptions}`
+        const res = await fetch(url, { signal: controller.signal })
+        window.clearTimeout(timer)
+
+        if (res.ok) {
+          const data = (await res.json()) as {
+            routes?: Array<{
+              distance?: number
+              duration?: number
+              geometry?: { coordinates?: Array<[number, number]> }
+              legs?: Array<{
+                steps?: Array<{
+                  name?: string
+                  ref?: string
+                  maneuver?: { location?: [number, number] }
+                }>
+              }>
+            }>
+          }
+          const primaryRoute = data?.routes?.[0]
+          if (primaryRoute) {
+            if (
+              typeof primaryRoute.distance === "number" &&
+              primaryRoute.distance > 0
+            ) {
+              roadDistanceKm = Number((primaryRoute.distance / 1000).toFixed(1))
+              osrmSucceeded = true
+            }
+            if (
+              typeof primaryRoute.duration === "number" &&
+              primaryRoute.duration > 0
+            ) {
+              durationMinutes = Math.max(
+                5,
+                Math.round(primaryRoute.duration / 60),
+              )
+              osrmSucceeded = true
+            }
+            if (!useLightweightOsrm) {
+              const coords = primaryRoute.geometry?.coordinates
+              if (Array.isArray(coords) && coords.length > 0) {
+                pathCoords = coords
+                  .map(([lng, lat]) => ({ lat: Number(lat), lng: Number(lng) }))
+                  .filter(isValidCoord)
+              }
+              const steps = primaryRoute.legs?.[0]?.steps || []
+              for (const step of steps) {
+                const rawName = (step?.name || "").trim()
+                if (
+                  rawName &&
+                  !isNavigationInstructionNoise(rawName) &&
+                  !rawName.includes(cleanStart) &&
+                  !rawName.includes(cleanDest) &&
+                  !osrmStepRoadNames.includes(rawName)
+                ) {
+                  osrmStepRoadNames.push(rawName)
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // 외부 라우팅 서버 오류/타임아웃 시 좌표 기반 거리·소요시간 폴백으로 안전하게 대체
+      }
+
+      const corridorHubs =
+        pathCoords.length >= 2
+          ? extractHubsAlongCorridor(
+              cleanStart,
+              cleanDest,
+              startCoord,
+              endCoord,
+              pathCoords,
+            )
+          : precomputedHubs
+
+      const mergedWaypoints: WaypointNode[] = [...corridorHubs]
+
+      // 코리도 거점이 2개 미만이고 OSRM 도로명이 추출되었다면 정제된 주요 도로명 보강
+      if (mergedWaypoints.length < 2 && osrmStepRoadNames.length > 0) {
+        for (const roadName of osrmStepRoadNames) {
+          if (
+            mergedWaypoints.length < 4 &&
+            !mergedWaypoints.some((w) => w.name === roadName)
+          ) {
+            mergedWaypoints.push({
+              name: roadName,
+              lat: (startCoord.lat + endCoord.lat) / 2,
+              lng: (startCoord.lng + endCoord.lng) / 2,
+              category: "road",
+            })
+          }
+        }
+      }
+
+      const finalObjects = mergedWaypoints.slice(0, 4)
+      const finalList = finalObjects.map((item) => item.name)
+
+      const result: RouteWaypointExtractionResult = {
         start: cleanStart,
         destination: cleanDest,
         startCoord,
         endCoord,
-        waypointsList: [],
-        waypointObjects: [],
-        formatted: DIRECT_ROUTE_LABEL,
-        estimatedDurationMinutes: 5,
-        distanceKm: Number(straightDistKm.toFixed(1)),
+        waypointsList: finalList,
+        waypointObjects: finalObjects,
+        formatted:
+          finalList.length > 0 ? finalList.join(" · ") : DIRECT_ROUTE_LABEL,
+        estimatedDurationMinutes: durationMinutes,
+        distanceKm: roadDistanceKm,
+        fallbackUsed: !osrmSucceeded,
       }
-      writeWaypointCache(cacheKey, directResult)
-      return directResult
-    }
 
-    let pathCoords: GeoCoord[] = []
-    let osrmStepRoadNames: string[] = []
-    let durationMinutes = Math.max(
-      8,
-      Math.min(90, Math.round(straightDistKm * 3.2 + 6)),
-    )
-    let roadDistanceKm = Number((straightDistKm * 1.28).toFixed(1))
-
-    // 실제 지도 라우팅 API (OSRM Driving Route API) 호출 - 타임아웃 및 예외 방어
-    try {
-      const controller = new AbortController()
-      const timer = window.setTimeout(() => controller.abort(), 2800)
-      const url = `https://router.project-osrm.org/route/v1/driving/${startCoord.lng},${startCoord.lat};${endCoord.lng},${endCoord.lat}?overview=full&geometries=geojson&steps=true`
-      const res = await fetch(url, { signal: controller.signal })
-      window.clearTimeout(timer)
-
-      if (res.ok) {
-        const data = (await res.json()) as {
-          routes?: Array<{
-            distance?: number
-            duration?: number
-            geometry?: { coordinates?: Array<[number, number]> }
-            legs?: Array<{
-              steps?: Array<{
-                name?: string
-                ref?: string
-                maneuver?: { location?: [number, number] }
-              }>
-            }>
-          }>
-        }
-        const primaryRoute = data?.routes?.[0]
-        if (primaryRoute) {
-          if (
-            typeof primaryRoute.distance === "number" &&
-            primaryRoute.distance > 0
-          ) {
-            roadDistanceKm = Number((primaryRoute.distance / 1000).toFixed(1))
-          }
-          if (
-            typeof primaryRoute.duration === "number" &&
-            primaryRoute.duration > 0
-          ) {
-            durationMinutes = Math.max(
-              5,
-              Math.round(primaryRoute.duration / 60),
-            )
-          }
-          const coords = primaryRoute.geometry?.coordinates
-          if (Array.isArray(coords) && coords.length > 0) {
-            pathCoords = coords
-              .map(([lng, lat]) => ({ lat: Number(lat), lng: Number(lng) }))
-              .filter(isValidCoord)
-          }
-          const steps = primaryRoute.legs?.[0]?.steps || []
-          for (const step of steps) {
-            const rawName = (step?.name || "").trim()
-            if (
-              rawName &&
-              !isNavigationInstructionNoise(rawName) &&
-              !rawName.includes(cleanStart) &&
-              !rawName.includes(cleanDest) &&
-              !osrmStepRoadNames.includes(rawName)
-            ) {
-              osrmStepRoadNames.push(rawName)
-            }
-          }
-        }
-      }
+      writeWaypointCache(cacheKey, result)
+      return result
     } catch {
-      // 외부 라우팅 서버 오류/방화벽 시 코리도 경로 분석으로 안전하게 대체
-    }
-
-    const corridorHubs = extractHubsAlongCorridor(
-      cleanStart,
-      cleanDest,
-      startCoord,
-      endCoord,
-      pathCoords,
-    )
-
-    const mergedWaypoints: WaypointNode[] = [...corridorHubs]
-
-    // 만약 코리도 거점이 2개 미만이고 OSRM 도로명이 추출되었다면 정제된 주요 도로명 보강
-    if (mergedWaypoints.length < 2 && osrmStepRoadNames.length > 0) {
-      for (const roadName of osrmStepRoadNames) {
-        if (
-          mergedWaypoints.length < 4 &&
-          !mergedWaypoints.some((w) => w.name === roadName)
-        ) {
-          mergedWaypoints.push({
-            name: roadName,
-            lat: (startCoord.lat + endCoord.lat) / 2,
-            lng: (startCoord.lng + endCoord.lng) / 2,
-            category: "road",
-          })
-        }
+      // 모든 예외 상황에서 앱이 멈추지 않도록 폴백 반환
+      const fallback = getExtractedWaypointsSync(
+        cleanStart,
+        cleanDest,
+        params.fallbackWaypoints,
+      )
+      return {
+        start: cleanStart,
+        destination: cleanDest,
+        startCoord: null,
+        endCoord: null,
+        waypointsList: fallback.waypointsList,
+        waypointObjects: fallback.waypointObjects,
+        formatted: fallback.formatted || DIRECT_ROUTE_LABEL,
+        estimatedDurationMinutes: fallback.estimatedDurationMinutes || 20,
+        distanceKm: fallback.distanceKm || 5,
+        fallbackUsed: true,
       }
+    } finally {
+      inFlightRouteRequests.delete(inflightKey)
     }
+  })()
 
-    const finalObjects = mergedWaypoints.slice(0, 4)
-    const finalList = finalObjects.map((item) => item.name)
+  inFlightRouteRequests.set(inflightKey, requestPromise)
+  return requestPromise
+}
 
-    const result: RouteWaypointExtractionResult = {
-      start: cleanStart,
-      destination: cleanDest,
-      startCoord,
-      endCoord,
-      waypointsList: finalList,
-      waypointObjects: finalObjects,
-      formatted:
-        finalList.length > 0 ? finalList.join(" · ") : DIRECT_ROUTE_LABEL,
-      estimatedDurationMinutes: durationMinutes,
-      distanceKm: roadDistanceKm,
-    }
-
-    writeWaypointCache(cacheKey, result)
-    return result
-  } catch {
-    // 모든 예외 상황에서 앱이 멈추지 않도록 폴백 반환
-    const fallback = getExtractedWaypointsSync(
-      cleanStart,
-      cleanDest,
-      params.fallbackWaypoints,
-    )
-    return {
-      start: cleanStart,
-      destination: cleanDest,
-      startCoord: null,
-      endCoord: null,
-      waypointsList: fallback.waypointsList,
-      waypointObjects: fallback.waypointObjects,
-      formatted: fallback.formatted || DIRECT_ROUTE_LABEL,
-      estimatedDurationMinutes: 20,
-      distanceKm: 5,
-      fallbackUsed: true,
-    }
+// 거리(km)와 예상 소요 시간(분)만 경량 OSRM(overview=false&steps=false)으로 빠르게 조회
+export async function fetchRouteMetrics(params: {
+  start: string
+  destination: string
+  startCoord?: Partial<GeoCoord> | null
+  endCoord?: Partial<GeoCoord> | null
+}): Promise<RouteMetricsSummary> {
+  const res = await fetchRouteWaypointsFromMapBackend({
+    ...params,
+    metricsOnly: true,
+  })
+  return {
+    distanceKm: res.distanceKm,
+    estimatedDurationMinutes: res.estimatedDurationMinutes,
+    fromCache: res.fromCache,
+    fallbackUsed: res.fallbackUsed,
   }
 }
