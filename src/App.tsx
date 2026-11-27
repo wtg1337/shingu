@@ -7545,9 +7545,38 @@ function SheetView({
                 <strong>
                   {formatBookingDateLabel(bookingDate)}에 등록된 카풀이 없어요
                 </strong>
-                <p>
-                  다른 날짜를 선택하거나 기본 경로·희망 시간을 조정해 보세요.
-                </p>
+                {(() => {
+                  const otherOpenDates = Array.from(
+                    new Set(
+                      (carpoolFlow?.rides || [])
+                        .filter(
+                          (r) =>
+                            r.status === "모집 중" &&
+                            String(r.date || "").slice(0, 10) !==
+                              String(bookingDate || "").slice(0, 10),
+                        )
+                        .map((r) => String(r.date || "").slice(0, 10))
+                        .filter(Boolean),
+                    ),
+                  ).sort()
+                  if (otherOpenDates.length > 0) {
+                    return (
+                      <p>
+                        다른 날짜(
+                        {otherOpenDates
+                          .slice(0, 3)
+                          .map((d) => formatBookingDateLabel(d))
+                          .join(", ")}
+                        )에 모집 중인 카풀이 있어요. 날짜를 변경해 확인해 보세요!
+                      </p>
+                    )
+                  }
+                  return (
+                    <p>
+                      다른 날짜를 선택하거나 기본 경로·희망 시간을 조정해 보세요.
+                    </p>
+                  )
+                })()}
                 <Button variant="soft" onClick={() => open("route-edit")}>
                   추천 조건 수정
                 </Button>

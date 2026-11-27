@@ -643,12 +643,42 @@ export async function supabaseCreateRide(
 ) {
   if (!isSupabaseConfigured()) return null
   try {
-    let resolvedDriverId = driverId
+    const currentUser = await supabaseGetCurrentUser()
+    const resolvedDriverId = isValidUuid(currentUser?.id)
+      ? currentUser!.id
+      : isValidUuid(driverId)
+        ? driverId!
+        : ""
     if (!isValidUuid(resolvedDriverId)) {
-      const currentUser = await supabaseGetCurrentUser()
-      resolvedDriverId = currentUser?.id
+      console.warn("supabaseCreateRide aborted: no valid auth user uuid")
+      return null
     }
-    if (!isValidUuid(resolvedDriverId)) return null
+
+    // 신규 가입 직후 등 public.users 행이 누락된 경우 외래키(driver_id) 오류 방지
+    if (currentUser?.id === resolvedDriverId) {
+      try {
+        const meta = currentUser.user_metadata || {}
+        await supabase.from("users").upsert(
+          {
+            id: resolvedDriverId,
+            email: currentUser.email || "",
+            name:
+              meta.name ||
+              ride.driverName ||
+              (currentUser.email || "").split("@")[0] ||
+              "운전자",
+            student_id: meta.student_id || "",
+            role: "driver",
+            manner_temp: 36.5,
+            points: 0,
+            is_verified: true,
+          },
+          { onConflict: "id", ignoreDuplicates: true },
+        )
+      } catch {
+        // ignore upsert precheck warning
+      }
+    }
 
     const departureIso = new Date(
       `${ride.date}T${(ride.time || "08:30").slice(0, 5)}:00+09:00`,
@@ -668,7 +698,10 @@ export async function supabaseCreateRide(
       .select()
       .single()
 
-    if (error) throw error
+    if (error) {
+      console.warn("supabaseCreateRide insert error:", error.message, error)
+      throw error
+    }
 
     // schedules 테이블에도 운행 일정 함께 기록
     try {

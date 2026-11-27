@@ -277,9 +277,16 @@ export function createCarpoolRide(
         if (inserted?.id) {
           const insertedId = String(inserted.id)
           const updatedRides = snapshot.rides.map((r) =>
-            r.id === ride.id ? { ...r, id: insertedId } : r,
+            r.id === ride.id
+              ? {
+                  ...r,
+                  id: insertedId,
+                  driverId: String(inserted.driver_id || r.driverId),
+                }
+              : r,
           )
           save({ ...snapshot, rides: updatedRides })
+          void syncCarpoolWithSupabase()
         }
       })
       .catch((err) => {
