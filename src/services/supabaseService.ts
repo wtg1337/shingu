@@ -113,6 +113,41 @@ export async function supabaseUploadLicenseFile(
   }
 }
 
+export async function supabaseResolveLoginEmails(
+  loginIdOrEmail: string,
+): Promise<string[]> {
+  const clean = (loginIdOrEmail || "").trim()
+  if (!clean) return []
+  if (clean.includes("@")) return [clean.toLowerCase()]
+
+  const candidates: string[] = []
+  if (isSupabaseConfigured()) {
+    try {
+      const { data } = await supabase
+        .from("users")
+        .select("email")
+        .ilike("student_id", clean)
+        .limit(3)
+      if (Array.isArray(data)) {
+        data.forEach((row) => {
+          const foundEmail = String(row?.email || "").trim().toLowerCase()
+          if (foundEmail && !candidates.includes(foundEmail)) {
+            candidates.push(foundEmail)
+          }
+        })
+      }
+    } catch {
+      // anon 조회 권한이 없으면 도메인 후보로 자동 시도
+    }
+  }
+
+  for (const domain of ["g.shingu.ac.kr", "shingu.ac.kr"]) {
+    const candidate = `${clean.toLowerCase()}@${domain}`
+    if (!candidates.includes(candidate)) candidates.push(candidate)
+  }
+  return candidates
+}
+
 export async function supabaseSignIn(email: string, password: string) {
   if (!isSupabaseConfigured()) {
     throw new Error("Supabase 환경변수가 설정되지 않았습니다.")

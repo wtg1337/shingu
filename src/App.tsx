@@ -136,6 +136,7 @@ import {
   getOrCreateMileageMemberCode,
 } from "./services/demoMileage"
 import {
+  supabaseResolveLoginEmails,
   supabaseSignIn,
   supabaseSignUp,
   supabaseSignOut,
@@ -2020,15 +2021,40 @@ function Auth({
         item.id.toLowerCase() === trimmedLoginId.toLowerCase() ||
         item.email.toLowerCase() === trimmedLoginId.toLowerCase(),
     )
-    const email = matchedLocal?.email
-      ? matchedLocal.email
-      : trimmedLoginId.includes("@")
-        ? trimmedLoginId
-        : `${trimmedLoginId}@shingu.ac.kr`
+    const resolvedEmails = await supabaseResolveLoginEmails(trimmedLoginId)
+    const emailCandidates = Array.from(
+      new Set(
+        [
+          ...(matchedLocal?.email ? [matchedLocal.email.trim().toLowerCase()] : []),
+          ...resolvedEmails,
+        ].filter(Boolean),
+      ),
+    )
+    const primaryEmail =
+      emailCandidates[0] ||
+      (trimmedLoginId.includes("@")
+        ? trimmedLoginId.toLowerCase()
+        : `${trimmedLoginId}@g.shingu.ac.kr`)
     try {
       if (isSupabaseConfigured()) {
         try {
-          const result = await supabaseSignIn(email, loginPassword)
+          let result: Awaited<ReturnType<typeof supabaseSignIn>> | null = null
+          let usedEmail = primaryEmail
+          let lastSignInError: unknown = null
+
+          for (const candidateEmail of emailCandidates) {
+            try {
+              result = await supabaseSignIn(candidateEmail, loginPassword)
+              usedEmail = candidateEmail
+              break
+            } catch (err) {
+              lastSignInError = err
+            }
+          }
+          if (!result) {
+            throw lastSignInError || new Error("로그인에 실패했습니다.")
+          }
+
           const user = result?.user
           const meta = user?.user_metadata
           const dbProfile = user?.id ? await supabaseGetProfile(user.id) : null
@@ -2042,9 +2068,9 @@ function Auth({
               dbProfile?.name ||
               meta?.name ||
               matchedLocal?.name ||
-              email.split("@")[0] ||
+              usedEmail.split("@")[0] ||
               "사용자",
-            email: user?.email || email,
+            email: user?.email || usedEmail,
             id: user?.id || trimmedLoginId,
             loginId: dbProfile?.loginId || trimmedLoginId,
             password: loginPassword,
@@ -2344,7 +2370,26 @@ function Auth({
             profilePayload.id = signUpRes.user.id
           }
         } catch (supabaseErr) {
-          console.warn("Supabase 회원가입 폴백 처리:", supabaseErr)
+          const rawMsg =
+            supabaseErr instanceof Error
+              ? supabaseErr.message
+              : String(supabaseErr || "")
+          let friendlyMsg =
+            "서버 회원가입에 실패했습니다. 입력 내용을 확인 후 다시 시도해 주세요."
+          if (/already registered|already exists/i.test(rawMsg)) {
+            friendlyMsg =
+              "이미 가입된 이메일입니다. 로그인 화면에서 바로 로그인해 주세요."
+          } else if (/password.*6|at least 6/i.test(rawMsg)) {
+            friendlyMsg = "비밀번호는 6자 이상으로 입력해 주세요."
+          } else if (/rate limit|too many/i.test(rawMsg)) {
+            friendlyMsg =
+              "요청이 너무 많습니다. 잠시 후 다시 회원가입을 시도해 주세요."
+          } else if (rawMsg) {
+            friendlyMsg = `회원가입 오류: ${rawMsg}`
+          }
+          setSignupError(friendlyMsg)
+          showAppToast({ message: friendlyMsg, variant: "danger" })
+          return
         }
       }
       // 별도의 이메일 인증 대기 화면 없이 자동 로그인되어 홈 화면으로 바로 진입
