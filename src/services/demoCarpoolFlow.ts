@@ -710,14 +710,60 @@ export async function syncCarpoolWithSupabase() {
     const revMap = new Map<string, DemoCarpoolReview>()
     remoteReviews.forEach((rev) => revMap.set(rev.id, rev))
 
-    save({
+    const nextState: DemoCarpoolState = {
       ...snapshot,
       rides: Array.from(rideMap.values()),
       applications: Array.from(appMap.values()),
       reviews: Array.from(revMap.values()),
-    })
+    }
+    if (
+      JSON.stringify(nextState.rides) !== JSON.stringify(snapshot.rides) ||
+      JSON.stringify(nextState.applications) !==
+        JSON.stringify(snapshot.applications) ||
+      JSON.stringify(nextState.reviews) !== JSON.stringify(snapshot.reviews)
+    ) {
+      save(nextState)
+    }
   } catch (err) {
     console.warn("syncCarpoolWithSupabase error:", err)
+  }
+}
+
+let carpoolRealtimeChannel: ReturnType<typeof supabase.channel> | null = null
+
+function setupCarpoolRealtimeSubscription() {
+  if (!isSupabaseConfigured() || typeof window === "undefined") return
+  try {
+    if (carpoolRealtimeChannel) {
+      void supabase.removeChannel(carpoolRealtimeChannel)
+      carpoolRealtimeChannel = null
+    }
+    carpoolRealtimeChannel = supabase
+      .channel(`carpool-realtime-changes-${Date.now()}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "carpools" },
+        () => {
+          void syncCarpoolWithSupabase()
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "carpool_requests" },
+        () => {
+          void syncCarpoolWithSupabase()
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "reviews" },
+        () => {
+          void syncCarpoolWithSupabase()
+        },
+      )
+      .subscribe()
+  } catch (e) {
+    console.warn("Supabase realtime setup failed:", e)
   }
 }
 
@@ -729,31 +775,33 @@ if (typeof window !== "undefined") {
   })
 
   if (isSupabaseConfigured()) {
-    // 초기 로드 시 Supabase 데이터 동기화
-    syncCarpoolWithSupabase()
+    // 초기 로드 시 Supabase 데이터 동기화 및 실시간 구독
+    void syncCarpoolWithSupabase()
+    setupCarpoolRealtimeSubscription()
 
-    // 실시간 변경 구독 (carpools, carpool_requests, reviews)
-    try {
-      supabase
-        .channel("carpool-realtime-changes")
-        .on(
-          "postgres_changes",
-          { event: "*", schema: "public", table: "carpools" },
-          () => syncCarpoolWithSupabase(),
-        )
-        .on(
-          "postgres_changes",
-          { event: "*", schema: "public", table: "carpool_requests" },
-          () => syncCarpoolWithSupabase(),
-        )
-        .on(
-          "postgres_changes",
-          { event: "*", schema: "public", table: "reviews" },
-          () => syncCarpoolWithSupabase(),
-        )
-        .subscribe()
-    } catch (e) {
-      console.warn("Supabase realtime setup failed:", e)
-    }
+    // 로그인 세션이 바뀌면 인증 토큰 기준으로 실시간 채널 재구독 + 즉시 동기화
+    supabase.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
+        setupCarpoolRealtimeSubscription()
+        void syncCarpoolWithSupabase()
+      }
+    })
+
+    // 창 포커스/탭 복귀 시 즉시 최신 신청·매칭 상태 동기화
+    window.addEventListener("focus", () => {
+      void syncCarpoolWithSupabase()
+    })
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        void syncCarpoolWithSupabase()
+      }
+    })
+
+    // Realtime 지연/미설정 환경에서도 새로고침 없이 반영되도록 4초 주기 자동 동기화 (화면 활성 시에만)
+    window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void syncCarpoolWithSupabase()
+      }
+    }, 4000)
   }
 }
