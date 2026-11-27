@@ -1880,6 +1880,76 @@ h3 { font-size: 16px; }
   height: 10px;
 }
 
+.bubble-settlement-card {
+  align-self: center;
+  width: 100%;
+  max-width: 310px;
+  margin: 6px auto;
+  padding: 13px 14px;
+  border-radius: 16px;
+  background: #ffffff;
+  border: 1.5px solid rgba(133, 189, 108, 0.55);
+  box-shadow: 0 6px 16px rgba(23, 54, 83, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bubble-settlement-card.is-complete {
+  background: #f2f9ef;
+  border-color: rgba(83, 146, 73, 0.35);
+}
+
+.bubble-settlement-card__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--navy);
+  font-size: 12.5px;
+}
+
+.bubble-settlement-card__head svg {
+  width: 15px;
+  height: 15px;
+  color: var(--green-dark);
+}
+
+.bubble-settlement-card__head strong {
+  flex: 1;
+}
+
+.bubble-settlement-card__head time {
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.bubble-settlement-card p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.48;
+  color: var(--text);
+  word-break: keep-all;
+}
+
+.bubble-settlement-card__done {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #e3f3dd;
+  color: var(--green-dark);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.bubble-settlement-card__done svg {
+  width: 13px;
+  height: 13px;
+}
+
 .waypoint-node-pill svg {
   width: 11px;
   height: 11px;

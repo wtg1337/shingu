@@ -103,6 +103,7 @@ import {
   endCarpoolRide,
   getCarpoolFlowSnapshot,
   getRemainingSeats,
+  requestSettlementInChat,
   resetCarpoolFlow,
   settleCarpoolRide,
   subscribeCarpoolFlow,
@@ -4062,11 +4063,21 @@ function DriverHome({
                 <CircleHelp />
                 <p>
                   <strong>정산 대기</strong>
-                  운행이 종료되었습니다. 정산을 진행해 주세요.
+                  운행이 종료되었습니다. 채팅방에서 탑승자에게 정산을 요청해
+                  주세요.
                 </p>
               </div>
-              <Button onClick={() => onOpenChat(newestRide.id)}>
-                정산하러 가기
+              <Button
+                onClick={() => {
+                  requestSettlementInChat(newestRide.id)
+                  showAppToast(
+                    "채팅방에 정산 요청을 보냈습니다. 탑승자가 바로 정산할 수 있어요.",
+                    "success",
+                  )
+                  onOpenChat(newestRide.id)
+                }}
+              >
+                채팅방에 정산 요청하기
               </Button>
             </>
           )}
@@ -5191,19 +5202,44 @@ function ChatPage({
             </p>
           </section>
         )}
-        {selectedFlowRide?.status === "정산 대기" && (
-          <section className="chat-settlement-card">
-            <span className="tag waiting">정산 대기</span>
-            <strong>운행이 종료되었습니다. 정산을 진행해 주세요.</strong>
-            <p>
-              {selectedFlowRide.start} → {selectedFlowRide.destination} ·{" "}
-              {selectedFlowRide.price.toLocaleString()} P
-            </p>
-            <Button onClick={() => setSettlementConfirmOpen(true)}>
-              정산하기
-            </Button>
-          </section>
-        )}
+        {selectedFlowRide?.status === "정산 대기" && (() => {
+          const isDriverInChat =
+            role === "driver" ||
+            Boolean(
+              selectedFlowRide.driverId &&
+                (selectedFlowRide.driverId === currentUserId ||
+                  selectedFlowRide.driverId === currentLoginId),
+            )
+          return (
+            <section className="chat-settlement-card">
+              <span className="tag waiting">정산 대기</span>
+              <strong>
+                {isDriverInChat
+                  ? "운행이 종료되었습니다. 탑승자의 정산을 기다리고 있어요."
+                  : "운행이 종료되었습니다. 아래 버튼을 눌러 정산을 완료해 주세요."}
+              </strong>
+              <p>
+                {selectedFlowRide.start} → {selectedFlowRide.destination} ·{" "}
+                {selectedFlowRide.price.toLocaleString()} P
+              </p>
+              {isDriverInChat ? (
+                <Button
+                  variant="soft"
+                  onClick={() => {
+                    requestSettlementInChat(selectedFlowRide.id)
+                    showAppToast("채팅방에 정산 요청을 보냈습니다.", "success")
+                  }}
+                >
+                  <WalletCards /> 정산 요청 다시 보내기
+                </Button>
+              ) : (
+                <Button onClick={() => setSettlementConfirmOpen(true)}>
+                  <WalletCards /> {selectedFlowRide.price.toLocaleString()} P 정산하기
+                </Button>
+              )}
+            </section>
+          )
+        })()}
         {selectedFlowRide?.status === "완료" && (
           <section className="chat-settlement-card complete">
             <span className="tag open">정산 완료</span>
@@ -5222,6 +5258,54 @@ function ChatPage({
                   msg?.senderName || counterpartName,
                 )
                 const senderInitial = senderLabel.slice(0, 1) || "?"
+                const isDriverInChat =
+                  role === "driver" ||
+                  Boolean(
+                    selectedFlowRide?.driverId &&
+                      (selectedFlowRide.driverId === currentUserId ||
+                        selectedFlowRide.driverId === currentLoginId),
+                  )
+
+                if (msg?.messageType === "settlement") {
+                  const isCompletedMsg = (msg?.text || "").includes("정산 완료")
+                  const canPassengerSettle =
+                    !isCompletedMsg &&
+                    !isDriverInChat &&
+                    selectedFlowRide?.status === "정산 대기"
+                  return (
+                    <div
+                      className={`bubble-settlement-card ${
+                        isCompletedMsg || selectedFlowRide?.status === "완료"
+                          ? "is-complete"
+                          : ""
+                      }`}
+                      key={msg.id}
+                    >
+                      <div className="bubble-settlement-card__head">
+                        <WalletCards />
+                        <strong>
+                          {isCompletedMsg ? "카풀 정산 완료" : "카풀 정산 요청"}
+                        </strong>
+                        <time>{formatChatTimestamp(msg?.createdAt)}</time>
+                      </div>
+                      <p>{msg?.text || ""}</p>
+                      {canPassengerSettle && selectedFlowRide && (
+                        <Button
+                          type="button"
+                          onClick={() => setSettlementConfirmOpen(true)}
+                        >
+                          {selectedFlowRide.price.toLocaleString()} P 정산하기
+                        </Button>
+                      )}
+                      {!isCompletedMsg &&
+                        selectedFlowRide?.status === "완료" && (
+                          <span className="bubble-settlement-card__done">
+                            <Check /> 정산 완료됨
+                          </span>
+                        )}
+                    </div>
+                  )
+                }
 
                 if (isMine) {
                   return (
@@ -5537,7 +5621,12 @@ function ChatPage({
                 <WalletCards />
               </span>
               <h2>정산을 진행할까요?</h2>
-              <p>운행이 완료된 카풀의 정산을 진행합니다.</p>
+              <p>
+                {selectedFlowRide.start} → {selectedFlowRide.destination} 카풀
+                이용료{" "}
+                <strong>{selectedFlowRide.price.toLocaleString()} P</strong>를
+                정산합니다.
+              </p>
               <div className="dialog-actions">
                 <Button
                   variant="ghost"
@@ -5547,11 +5636,18 @@ function ChatPage({
                 </Button>
                 <Button
                   onClick={() => {
-                    settleCarpoolRide(selectedFlowRide.id)
+                    settleCarpoolRide(selectedFlowRide.id, {
+                      id: currentUserId,
+                      name: account?.name,
+                    })
                     setSettlementConfirmOpen(false)
+                    showAppToast(
+                      `${selectedFlowRide.price.toLocaleString()} P 정산이 완료되었습니다!`,
+                      "success",
+                    )
                   }}
                 >
-                  정산 완료
+                  {selectedFlowRide.price.toLocaleString()} P 정산 완료
                 </Button>
               </div>
             </section>

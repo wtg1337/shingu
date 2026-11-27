@@ -518,6 +518,52 @@ export function cancelCarpoolApplication(applicationId: string) {
   }
 }
 
+export function requestSettlementInChat(rideId: string) {
+  const ride = snapshot.rides.find((item) => item.id === rideId)
+  if (!ride) return
+  const approvedApps = snapshot.applications.filter(
+    (item) => item.rideId === rideId && item.status === "승인 완료",
+  )
+  const targetApps =
+    approvedApps.length > 0
+      ? approvedApps
+      : snapshot.applications.filter((item) => item.rideId === rideId).slice(0, 1)
+
+  const settlementText = `[정산 요청] ${ride.start} → ${ride.destination} 운행이 종료되었습니다. 아래 버튼을 눌러 ${ride.price.toLocaleString()} P 정산을 진행해 주세요.`
+
+  targetApps.forEach((app) => {
+    const { room } = getOrCreateCarpoolChatRoom({
+      currentUser: {
+        id: ride.driverId,
+        name: ride.driverName,
+        role: "driver",
+        carInfo: ride.vehicle,
+        licenseVerified: true,
+      },
+      counterpart: {
+        id: app.riderId,
+        name: app.riderName,
+        role: "rider",
+      },
+      ride: {
+        id: ride.id,
+        start: ride.start,
+        destination: ride.destination,
+        date: ride.date,
+        time: ride.time,
+        waypoints: ride.waypoints,
+      },
+    })
+    sendRealtimeChatMessage({
+      roomId: room.id,
+      senderId: ride.driverId,
+      senderName: ride.driverName,
+      text: settlementText,
+      messageType: "settlement",
+    })
+  })
+}
+
 export function endCarpoolRide(rideId: string) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
   if (!ride || ride.status !== "모집 중") return
@@ -541,9 +587,14 @@ export function endCarpoolRide(rideId: string) {
       settlementStatus: "정산 대기",
     }).catch(console.warn)
   }
+  // 운행 종료 즉시 연결된 채팅방에 정산 요청 메시지 전송
+  requestSettlementInChat(rideId)
 }
 
-export function settleCarpoolRide(rideId: string) {
+export function settleCarpoolRide(
+  rideId: string,
+  payer?: { id?: string; name?: string },
+) {
   const ride = snapshot.rides.find((item) => item.id === rideId)
   if (!ride || ride.settlementStatus !== "정산 대기") return
   const settledAt = new Date().toISOString()
@@ -560,6 +611,45 @@ export function settleCarpoolRide(rideId: string) {
         : item,
     ),
   })
+
+  // 채팅방에 정산 완료 메시지 전송 (로컬 즉시 반영 + Supabase Realtime 동기화)
+  const approvedApp = snapshot.applications.find(
+    (item) => item.rideId === rideId && item.status === "승인 완료",
+  )
+  const payerId = payer?.id || approvedApp?.riderId || "user-rider"
+  const payerName = payer?.name || approvedApp?.riderName || "탑승자"
+  if (approvedApp || payer?.id) {
+    const { room } = getOrCreateCarpoolChatRoom({
+      currentUser: {
+        id: payerId,
+        name: payerName,
+        role: "rider",
+      },
+      counterpart: {
+        id: ride.driverId,
+        name: ride.driverName,
+        role: "driver",
+        carInfo: ride.vehicle,
+        licenseVerified: true,
+      },
+      ride: {
+        id: ride.id,
+        start: ride.start,
+        destination: ride.destination,
+        date: ride.date,
+        time: ride.time,
+        waypoints: ride.waypoints,
+      },
+    })
+    sendRealtimeChatMessage({
+      roomId: room.id,
+      senderId: payerId,
+      senderName: payerName,
+      text: `[정산 완료] ${ride.price.toLocaleString()} P 카풀 정산이 완료되었습니다. 안전한 운행 감사합니다!`,
+      messageType: "settlement",
+    })
+  }
+
   if (isSupabaseConfigured()) {
     supabaseUpdateRideStatus(rideId, "완료", {
       settledAt,
