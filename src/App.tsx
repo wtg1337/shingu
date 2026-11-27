@@ -11926,7 +11926,6 @@ export default function App() {
   const handleGlobalDateChange = (nextDateKey: string) => {
     setBookingDate(nextDateKey)
     writeDemoValue("selected-booking-date", nextDateKey)
-    updateCarpoolRidesTimeAndDate({ date: nextDateKey })
     setSelectedRide((prev) => {
       if (!prev) return null
       const formattedDate = new Date(`${nextDateKey}T00:00:00`).toLocaleDateString(
@@ -11982,7 +11981,6 @@ export default function App() {
       }
       return updatedAll
     })
-    updateCarpoolRidesTimeAndDate({ time: safeDep })
     setSelectedRide((prev) => {
       if (!prev) return null
       const nextEta =
@@ -12422,7 +12420,6 @@ export default function App() {
             }
             setRoutesByRole(updated)
             writeDemoData("routes", updated)
-            updateCarpoolRidesTimeAndDate({ time: resolved.departure24 })
             void fetchRouteWaypointsFromMapBackend({
               start: safeRoute.start,
               destination: safeRoute.destination,

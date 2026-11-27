@@ -291,6 +291,13 @@ export function createCarpoolRide(
       })
       .catch((err) => {
         console.warn("createCarpoolRide supabase insert failed:", err)
+        const msg =
+          err instanceof Error
+            ? err.message
+            : typeof err === "object" && err && "message" in err
+              ? String((err as { message?: unknown }).message)
+              : "서버 저장에 실패했습니다."
+        showAppToast(`카풀 서버 저장 실패: ${msg}`, "danger")
       })
   }
   // 백엔드 경로 API 기반 경유지 비동기 정밀 갱신 (로컬 표시 보강)

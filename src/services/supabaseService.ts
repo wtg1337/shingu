@@ -650,8 +650,7 @@ export async function supabaseCreateRide(
         ? driverId!
         : ""
     if (!isValidUuid(resolvedDriverId)) {
-      console.warn("supabaseCreateRide aborted: no valid auth user uuid")
-      return null
+      throw new Error("로그인 세션이 만료되었습니다. 다시 로그인 후 등록해 주세요.")
     }
 
     // 신규 가입 직후 등 public.users 행이 누락된 경우 외래키(driver_id) 오류 방지
@@ -720,7 +719,7 @@ export async function supabaseCreateRide(
     return data
   } catch (err) {
     console.warn("supabaseCreateRide failed:", err)
-    return null
+    throw err
   }
 }
 
