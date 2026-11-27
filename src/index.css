@@ -1856,6 +1856,30 @@ h3 { font-size: 16px; }
   font-weight: 800;
 }
 
+.waypoint-node-pill__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(31, 95, 59, 0.14);
+  color: var(--green-dark);
+  cursor: pointer;
+}
+
+.waypoint-node-pill__remove:hover {
+  background: rgba(31, 95, 59, 0.26);
+}
+
+.waypoint-node-pill__remove svg {
+  width: 10px;
+  height: 10px;
+}
+
 .waypoint-node-pill svg {
   width: 11px;
   height: 11px;

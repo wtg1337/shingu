@@ -202,6 +202,14 @@ import type {
 type Tab = "home" | "schedule" | "chat" | "profile"
 type AuthView = "login" | "signup" | "reset"
 const formatPoints = (value: number) => `${value.toLocaleString("ko-KR")} P`
+const parseWaypointInputTags = (raw?: string | null): string[] => {
+  const trimmed = (raw || "").trim()
+  if (!trimmed || trimmed === DIRECT_ROUTE_LABEL) return []
+  return trimmed
+    .split(/[·,|/]+/)
+    .map((item) => item.trim())
+    .filter((item, idx, arr) => Boolean(item) && arr.indexOf(item) === idx)
+}
 type MatchRide = {
   id: string
   flowRideId?: string
@@ -7781,12 +7789,14 @@ function SheetView({
             <Field
               label="주요 경유지 (지도 경로 자동 추출)"
               value={createDraft.waypoints}
-              onChange={(event) =>
+              onChange={(event) => {
+                const nextValue = event.target.value
                 setCreateDraft({
                   ...createDraft,
-                  waypoints: event.target.value,
+                  waypoints: nextValue,
                 })
-              }
+                setCreateWaypointsList(parseWaypointInputTags(nextValue))
+              }}
               placeholder="출발지·목적지 입력 시 실제 경로 경유지가 자동 추출됩니다"
               icon={<MapPin />}
             />
@@ -7801,6 +7811,23 @@ function SheetView({
                   {(createWaypointsList ?? []).map((wp, idx) => (
                     <span className="waypoint-node-pill" key={`${wp}-${idx}`}>
                       <MapPin /> {wp}
+                      <button
+                        type="button"
+                        className="waypoint-node-pill__remove"
+                        aria-label={`${wp} 경유지 삭제`}
+                        onClick={() => {
+                          const nextList = (createWaypointsList ?? []).filter(
+                            (_, i) => i !== idx,
+                          )
+                          setCreateWaypointsList(nextList)
+                          setCreateDraft((prev) => ({
+                            ...prev,
+                            waypoints: nextList.join(" · "),
+                          }))
+                        }}
+                      >
+                        <X />
+                      </button>
                     </span>
                   ))}
                 </div>
@@ -9349,10 +9376,14 @@ function SheetView({
                   : routeDraft.pickup || routeDraft.waypoint
               }
               onChange={(event) => {
+                const nextValue = event.target.value
+                const nextTags = parseWaypointInputTags(nextValue)
+                setRouteWaypointsList(nextTags)
                 setRouteDraft({
                   ...routeDraft,
-                  [role === "driver" ? "waypoint" : "pickup"]:
-                    event.target.value,
+                  waypoint: nextValue,
+                  ...(role === "driver" ? {} : { pickup: nextValue }),
+                  waypointsList: nextTags,
                 })
                 setRouteDirty(true)
               }}
@@ -9370,6 +9401,27 @@ function SheetView({
                   {(routeWaypointsList ?? []).map((wp, idx) => (
                     <span className="waypoint-node-pill" key={`${wp}-${idx}`}>
                       <MapPin /> {wp}
+                      <button
+                        type="button"
+                        className="waypoint-node-pill__remove"
+                        aria-label={`${wp} 경유지 삭제`}
+                        onClick={() => {
+                          const nextList = (routeWaypointsList ?? []).filter(
+                            (_, i) => i !== idx,
+                          )
+                          const nextText = nextList.join(" · ")
+                          setRouteWaypointsList(nextList)
+                          setRouteDraft((prev) => ({
+                            ...prev,
+                            waypoint: nextText,
+                            ...(role === "driver" ? {} : { pickup: nextText }),
+                            waypointsList: nextList,
+                          }))
+                          setRouteDirty(true)
+                        }}
+                      >
+                        <X />
+                      </button>
                     </span>
                   ))}
                 </div>
