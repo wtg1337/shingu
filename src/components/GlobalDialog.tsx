@@ -68,90 +68,113 @@ export default function GlobalDialog() {
       {toast && (
         <div
           key={toast.id}
-          role="status"
-          aria-live="polite"
           style={{
             position: "fixed",
-            top: "18px",
-            left: "50%",
-            transform: "translateX(-50%)",
+            top: "max(18px, env(safe-area-inset-top, 18px))",
+            left: 0,
+            right: 0,
             zIndex: 100000,
-            width: "min(92vw, 390px)",
             display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "10px",
-            padding: "12px 15px",
-            borderRadius: "16px",
-            background:
-              toast.variant === "danger"
-                ? "#d63031"
-                : toast.variant === "info"
-                  ? "#173653"
-                  : "#1f4733",
-            color: "#ffffff",
-            boxShadow: "0 12px 28px rgba(23, 54, 83, 0.25)",
-            fontSize: "12.5px",
-            fontWeight: 700,
-            lineHeight: 1.4,
-            animation: "reset-slide-down 0.22s ease-out forwards",
+            justifyContent: "center",
+            padding: "0 16px",
+            pointerEvents: "none",
           }}
         >
-          <span style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              width: "100%",
+              maxWidth: "390px",
+              boxSizing: "border-box",
+              pointerEvents: "auto",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "10px",
+              padding: "12px 15px",
+              borderRadius: "16px",
+              background:
+                toast.variant === "danger"
+                  ? "#d63031"
+                  : toast.variant === "info"
+                    ? "#173653"
+                    : "#1f4733",
+              color: "#ffffff",
+              boxShadow: "0 12px 28px rgba(23, 54, 83, 0.25)",
+              fontSize: "12.5px",
+              fontWeight: 700,
+              lineHeight: 1.4,
+              wordBreak: "keep-all",
+              animation: "reset-slide-down 0.22s ease-out forwards",
+            }}
+          >
             <span
               style={{
-                width: "22px",
-                height: "22px",
-                borderRadius: "50%",
-                background: "rgba(255,255,255,0.18)",
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flex: 1,
+                minWidth: 0,
+              }}
+            >
+              <span
+                style={{
+                  width: "22px",
+                  height: "22px",
+                  borderRadius: "50%",
+                  background: "rgba(255,255,255,0.18)",
+                  display: "grid",
+                  placeItems: "center",
+                  flexShrink: 0,
+                }}
+              >
+                {toast.variant === "danger" ? <CircleHelp /> : <Check />}
+              </span>
+              <span style={{ wordBreak: "keep-all" }}>{toast.message}</span>
+            </span>
+            {toast.actionLabel && toast.onAction && (
+              <button
+                type="button"
+                onClick={() => {
+                  const fn = toast.onAction
+                  dismissAppToast()
+                  fn?.()
+                }}
+                style={{
+                  border: 0,
+                  borderRadius: "10px",
+                  padding: "6px 10px",
+                  background: "#96c449",
+                  color: "#173653",
+                  fontSize: "11px",
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                {toast.actionLabel}
+              </button>
+            )}
+            <button
+              type="button"
+              aria-label="알림 닫기"
+              onClick={dismissAppToast}
+              style={{
+                border: 0,
+                background: "transparent",
+                color: "rgba(255,255,255,0.75)",
+                padding: "2px",
+                cursor: "pointer",
                 display: "grid",
                 placeItems: "center",
                 flexShrink: 0,
               }}
             >
-              {toast.variant === "danger" ? <CircleHelp /> : <Check />}
-            </span>
-            <span>{toast.message}</span>
-          </span>
-          {toast.actionLabel && toast.onAction && (
-            <button
-              type="button"
-              onClick={() => {
-                const fn = toast.onAction
-                dismissAppToast()
-                fn?.()
-              }}
-              style={{
-                border: 0,
-                borderRadius: "10px",
-                padding: "6px 10px",
-                background: "#96c449",
-                color: "#173653",
-                fontSize: "11px",
-                fontWeight: 800,
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {toast.actionLabel}
+              <X />
             </button>
-          )}
-          <button
-            type="button"
-            aria-label="알림 닫기"
-            onClick={dismissAppToast}
-            style={{
-              border: 0,
-              background: "transparent",
-              color: "rgba(255,255,255,0.75)",
-              padding: "2px",
-              cursor: "pointer",
-              display: "grid",
-              placeItems: "center",
-            }}
-          >
-            <X />
-          </button>
+          </div>
         </div>
       )}
 
