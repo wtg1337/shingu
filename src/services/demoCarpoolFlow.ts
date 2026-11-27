@@ -270,34 +270,47 @@ export function createCarpoolRide(
     createdAt: new Date().toISOString(),
   }
   save({ ...snapshot, rides: [ride, ...snapshot.rides] })
-  // 백엔드 지도 라우팅 기반 경유지 비동기 정밀 갱신 및 DB 저장
+  // Supabase carpools 테이블에 즉시 저장 (경로 API 응답을 기다리지 않음)
+  if (isSupabaseConfigured()) {
+    supabaseCreateRide(ride, input.driverId)
+      .then((inserted) => {
+        if (inserted?.id) {
+          const insertedId = String(inserted.id)
+          const updatedRides = snapshot.rides.map((r) =>
+            r.id === ride.id ? { ...r, id: insertedId } : r,
+          )
+          save({ ...snapshot, rides: updatedRides })
+        }
+      })
+      .catch((err) => {
+        console.warn("createCarpoolRide supabase insert failed:", err)
+      })
+  }
+  // 백엔드 경로 API 기반 경유지 비동기 정밀 갱신 (로컬 표시 보강)
   void fetchRouteWaypointsFromMapBackend({
     start: ride.start,
     destination: ride.destination,
     fallbackWaypoints: input.waypoints,
   })
     .then((mapResult) => {
-      const updatedRide: DemoCarpoolRide = {
-        ...ride,
-        waypoints: mapResult.formatted || ride.waypoints || DIRECT_ROUTE_LABEL,
-        waypointsList: mapResult.waypointsList,
-      }
       save({
         ...snapshot,
-        rides: snapshot.rides.map((r) => (r.id === ride.id ? updatedRide : r)),
+        rides: snapshot.rides.map((r) =>
+          r.id === ride.id ||
+          (r.driverId === ride.driverId &&
+            r.start === ride.start &&
+            r.destination === ride.destination &&
+            r.date === ride.date &&
+            r.time === ride.time)
+            ? {
+                ...r,
+                waypoints:
+                  mapResult.formatted || r.waypoints || DIRECT_ROUTE_LABEL,
+                waypointsList: mapResult.waypointsList,
+              }
+            : r,
+        ),
       })
-      if (isSupabaseConfigured()) {
-        supabaseCreateRide(updatedRide, input.driverId)
-          .then((inserted) => {
-            if (inserted?.id) {
-              const updatedRides = snapshot.rides.map((r) =>
-                r.id === ride.id ? { ...r, id: String(inserted.id) } : r,
-              )
-              save({ ...snapshot, rides: updatedRides })
-            }
-          })
-          .catch(console.warn)
-      }
     })
     .catch(console.warn)
   return ride
@@ -663,30 +676,46 @@ export async function syncCarpoolWithSupabase() {
       supabaseGetReviews(),
     ])
 
-    if (
-      remoteRides.length > 0 ||
-      remoteApps.length > 0 ||
-      remoteReviews.length > 0
-    ) {
-      const rideMap = new Map<string, DemoCarpoolRide>()
-      snapshot.rides.forEach((r) => rideMap.set(r.id, r))
-      remoteRides.forEach((r) => rideMap.set(r.id, r))
+    const rideMap = new Map<string, DemoCarpoolRide>()
+    remoteRides.forEach((r) => rideMap.set(r.id, r))
+    // 아직 Supabase UUID가 발급되기 직전인 로컬 임시 카풀만 중복 없이 보존
+    snapshot.rides.forEach((localRide) => {
+      if (!localRide.id.startsWith("carpool-")) return
+      const alreadySynced = remoteRides.some(
+        (remote) =>
+          remote.driverId === localRide.driverId &&
+          remote.start === localRide.start &&
+          remote.destination === localRide.destination &&
+          remote.date === localRide.date &&
+          remote.time === localRide.time,
+      )
+      if (!alreadySynced) {
+        rideMap.set(localRide.id, localRide)
+      }
+    })
 
-      const appMap = new Map<string, DemoCarpoolApplication>()
-      snapshot.applications.forEach((a) => appMap.set(a.id, a))
-      remoteApps.forEach((a) => appMap.set(a.id, a))
+    const appMap = new Map<string, DemoCarpoolApplication>()
+    remoteApps.forEach((a) => appMap.set(a.id, a))
+    snapshot.applications.forEach((localApp) => {
+      if (localApp.id.startsWith("application-")) {
+        const alreadySynced = remoteApps.some(
+          (remote) =>
+            remote.rideId === localApp.rideId &&
+            remote.riderId === localApp.riderId,
+        )
+        if (!alreadySynced) appMap.set(localApp.id, localApp)
+      }
+    })
 
-      const revMap = new Map<string, DemoCarpoolReview>()
-      snapshot.reviews.forEach((rev) => revMap.set(rev.id, rev))
-      remoteReviews.forEach((rev) => revMap.set(rev.id, rev))
+    const revMap = new Map<string, DemoCarpoolReview>()
+    remoteReviews.forEach((rev) => revMap.set(rev.id, rev))
 
-      save({
-        ...snapshot,
-        rides: Array.from(rideMap.values()),
-        applications: Array.from(appMap.values()),
-        reviews: Array.from(revMap.values()),
-      })
-    }
+    save({
+      ...snapshot,
+      rides: Array.from(rideMap.values()),
+      applications: Array.from(appMap.values()),
+      reviews: Array.from(revMap.values()),
+    })
   } catch (err) {
     console.warn("syncCarpoolWithSupabase error:", err)
   }

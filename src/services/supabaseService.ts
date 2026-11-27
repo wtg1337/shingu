@@ -447,7 +447,7 @@ export async function supabaseGetRoute(
       .select("*")
       .eq("user_id", userId)
       .eq("title", titleKey)
-      .order("created_at", { ascending: false })
+      .order("schedule_date", { ascending: false })
       .limit(1)
       .maybeSingle()
     if (error || !data) return null
@@ -550,14 +550,18 @@ export async function supabaseGetRides(): Promise<DemoCarpoolRide[]> {
       supabase
         .from("carpools")
         .select("*")
-        .order("created_at", { ascending: false }),
+        .order("departure_time", { ascending: true }),
       supabase.from("users").select("id, name, email, student_id"),
       supabase
         .from("driver_profiles")
         .select("user_id, car_model, car_number, max_passengers"),
     ])
 
-    if (carpoolsRes.error || !carpoolsRes.data) return []
+    if (carpoolsRes.error) {
+      console.warn("supabaseGetRides carpools query error:", carpoolsRes.error)
+      return []
+    }
+    if (!carpoolsRes.data) return []
 
     const userMap = new Map<string, any>()
     ;(usersRes.data || []).forEach((u) => userMap.set(String(u.id), u))
@@ -576,10 +580,15 @@ export async function supabaseGetRides(): Promise<DemoCarpoolRide[]> {
       const validDate = !Number.isNaN(depDateObj.getTime())
         ? depDateObj
         : new Date()
-      const dateStr = validDate.toLocaleDateString("en-CA")
-      const timeStr = `${String(validDate.getHours()).padStart(2, "0")}:${String(
-        validDate.getMinutes(),
-      ).padStart(2, "0")}`
+      const dateStr = validDate.toLocaleDateString("en-CA", {
+        timeZone: "Asia/Seoul",
+      })
+      const timeStr = new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Seoul",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).format(validDate)
 
       const extracted = getExtractedWaypointsSync(
         item.origin || "",
@@ -642,7 +651,7 @@ export async function supabaseCreateRide(
     if (!isValidUuid(resolvedDriverId)) return null
 
     const departureIso = new Date(
-      `${ride.date}T${(ride.time || "08:30").slice(0, 5)}:00`,
+      `${ride.date}T${(ride.time || "08:30").slice(0, 5)}:00+09:00`,
     ).toISOString()
 
     const { data, error } = await supabase
@@ -728,15 +737,16 @@ export async function supabaseGetApplications(): Promise<
   if (!isSupabaseConfigured()) return []
   try {
     const [reqsRes, usersRes, carpoolsRes] = await Promise.all([
-      supabase
-        .from("carpool_requests")
-        .select("*")
-        .order("created_at", { ascending: false }),
+      supabase.from("carpool_requests").select("*"),
       supabase.from("users").select("id, name"),
       supabase.from("carpools").select("id, driver_id"),
     ])
 
-    if (reqsRes.error || !reqsRes.data) return []
+    if (reqsRes.error) {
+      console.warn("supabaseGetApplications query error:", reqsRes.error)
+      return []
+    }
+    if (!reqsRes.data) return []
 
     const userMap = new Map<string, string>()
     ;(usersRes.data || []).forEach((u) =>
@@ -1138,8 +1148,7 @@ export async function supabaseGetSafetyReports(): Promise<SafetyReport[]> {
       supabase
         .from("reports_blocks")
         .select("*")
-        .eq("type", "report")
-        .order("created_at", { ascending: false }),
+        .eq("type", "report"),
       supabase.from("users").select("id, name, role"),
     ])
     if (reportsRes.error || !reportsRes.data) return []
@@ -1178,8 +1187,7 @@ export async function supabaseGetBlockedUsers(): Promise<BlockedUser[]> {
       supabase
         .from("reports_blocks")
         .select("*")
-        .eq("type", "block")
-        .order("created_at", { ascending: false }),
+        .eq("type", "block"),
       supabase.from("users").select("id, name"),
     ])
     if (blocksRes.error || !blocksRes.data) return []
@@ -1248,10 +1256,7 @@ export async function supabaseUnblockUser(blockRowId: string) {
 export async function supabaseGetReviews(): Promise<DemoCarpoolReview[]> {
   if (!isSupabaseConfigured()) return []
   try {
-    const { data, error } = await supabase
-      .from("reviews")
-      .select("*")
-      .order("created_at", { ascending: false })
+    const { data, error } = await supabase.from("reviews").select("*")
     if (error || !data) return []
     return data.map((item) => ({
       id: String(item.id),
